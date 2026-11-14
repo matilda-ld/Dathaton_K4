@@ -222,6 +222,15 @@ def build_matrix(cache: FeatureCache, recs: list[dict], vocab: dict, source: str
         elif source == "feedback":
             wr *= FEEDBACK_WEIGHT
         slots = np.arange(k, dtype=np.float32)
+        if source == "history" and S.bought.size:
+            # El histórico se generó SIN la regla "lo ya comprado casi no se recompra" (aclaración de la
+            # organización). Esas filas enseñarían al modelo justo lo contrario de lo que puntúa: fuera.
+            # El feedback propio sí sigue la regla y se queda entero.
+            keep = ~np.isin(cands, S.bought)
+            if not keep.any():
+                continue
+            cands, lab_c, slots, wr = cands[keep], lab_c[keep], slots[keep], wr[keep]
+            k = len(cands)
         if not lab_c.any() and 0 < neg_keep < k:      # impresión sin clic: basta una muestra de sus filas
             keep = np.sort(rng.choice(k, neg_keep, replace=False))
             cands, lab_c, slots, wr = cands[keep], lab_c[keep], slots[keep], wr[keep] * (k / neg_keep)
@@ -285,16 +294,23 @@ def policy_eval(cache: FeatureCache, bundle: dict, recs: list[dict], n: int) -> 
     from recommender_v2 import Ranker, rank_batch
 
     ranker = Ranker(bundle)
-    clicked = [r for r in recs if fc.as_pid(r.get("clicked"))][-n:]
+    def fresh_click(r: dict) -> bool:      # solo clics en productos que el usuario NO había comprado ya
+        c = cache.pid2idx.get(fc.as_pid(r.get("clicked")))
+        if c is None:
+            return False
+        R = cache.parse_request(r)
+        return c not in set(cache.session(R).bought.tolist())
+
+    clicked = [r for r in recs if fresh_click(r)][-n:]
     if not clicked:
         return {}
     base10 = set(cache.best[:10])
-    hits = {"baseline": 0, "retrieval": 0, "cand": 0, "full": 0}
-    buy_hits = {"baseline": 0, "cand": 0, "full": 0}
+    hits = {"baseline": 0, "retrieval": 0, "cand": 0, "wide": 0}
+    buy_hits = {"baseline": 0, "cand": 0, "wide": 0}
     n_buy = 0
     for i in range(0, len(clicked), 4):
         chunk = clicked[i: i + 4]
-        tops = {arm: rank_batch(cache, ranker, chunk, [arm] * len(chunk)) for arm in ("cand", "full")}
+        tops = {arm: rank_batch(cache, ranker, chunk, [arm] * len(chunk)) for arm in ("cand", "wide")}
         for j, r in enumerate(chunk):
             c, b = fc.as_pid(r.get("clicked")), fc.as_pid(r.get("purchased"))
             R = cache.parse_request(r)
@@ -303,7 +319,7 @@ def policy_eval(cache: FeatureCache, bundle: dict, recs: list[dict], n: int) -> 
             hits["baseline"] += c in base10
             n_buy += bool(b)
             buy_hits["baseline"] += bool(b) and b in base10
-            for arm in ("cand", "full"):
+            for arm in ("cand", "wide"):
                 top = tops[arm][j][0] or []
                 hits[arm] += c in top
                 buy_hits[arm] += bool(b) and b in top
@@ -518,13 +534,13 @@ def run_once(args) -> None:
               "direct": m_dir.model_to_string(num_iteration=it_dir) if m_dir is not None else None,
               "cache_blocks": sorted(k for k, v in cache.status.items() if v == "OK"),
               "combine": combine, "features": list(FEATURES), "vocab": vocab, "cat_names": cache.cat_names,
-              "version": version, "cut": cut, "trained_at": time.time(), "full_catalog": False}
+              "version": version, "cut": cut, "trained_at": time.time(), "wide_pool": False}
     if valid_recs and args.eval_n > 0:
         try:
             pe = metrics["pipeline_completo"] = policy_eval(cache, bundle, valid_recs, args.eval_n)
             hb, hc = pe.get("hit@10_compra", {}), pe.get("hit@10_clic", {})
-            bundle["full_catalog"] = (hb.get("full", 0), hc.get("full", 0)) > (hb.get("cand", 0), hc.get("cand", 0))
-            metrics["brazo_preferido_offline"] = "full" if bundle["full_catalog"] else "cand"
+            bundle["wide_pool"] = (hb.get("wide", 0), hc.get("wide", 0)) > (hb.get("cand", 0), hc.get("cand", 0))
+            metrics["brazo_preferido_offline"] = "wide" if bundle["wide_pool"] else "cand"
         except Exception as e:  # noqa: BLE001
             log(f"evaluación del pipeline omitida: {str(e)[:200]}")
     log("validación:\n" + json.dumps(metrics, indent=2, ensure_ascii=False))

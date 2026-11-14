@@ -47,6 +47,7 @@ import threading
 import time
 import zlib
 from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -56,15 +57,23 @@ from features_cache import F, FeatureCache, log
 
 HERE = Path(__file__).resolve().parent
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", HERE / "models" / "ranker.pkl"))
-STATE_PATH = Path(os.environ.get("STATE_PATH", HERE / "state" / "live_stats.json"))
+STATE_PATH = Path(os.environ.get("STATE_PATH", HERE / "state" / "live_stats_v7.json"))
 POLL = float(os.environ.get("POLL_SECONDS", 0.15))
 MAX_AGE = 6.0            # peticiones más viejas que esto ya han recibido el fallback: no se contestan
 EXPLORE_RATE = float(os.environ.get("EXPLORE_RATE", 0.0))
 HOLDOUT = float(os.environ.get("HOLDOUT", 0.0))
-PUBLIC_NAME = os.environ.get("PUBLIC_NAME", "v6")   # prefijo del model_version que aparece en el marcador
+PUBLIC_NAME = os.environ.get("PUBLIC_NAME", "v7")   # prefijo del model_version que aparece en el marcador
 LABELS_PATH = STATE_PATH.with_name("labels.json")
+# Brazos: cand = ~80 candidatos · wide = ~250 candidatos (aprovecha el margen de tiempo) · full = todo el catálogo.
+# ab (por defecto) reparte 50/50 entre cand y wide; en la final se queda solo el que más compras reales consiga.
 ARM = os.environ.get("ARM", "ab").lower()
-REBUY_PENALTY = float(os.environ.get("REBUY_PENALTY", 1.0))
+SLOW_COMPUTE_MS = float(os.environ.get("SLOW_COMPUTE_MS", 150))   # por encima, el catálogo completo se apaga solo
+SLOW_P95_MS = float(os.environ.get("SLOW_P95_MS", 2400))
+# Regla del simulador (aclarada por la organización): quien ya compró un producto casi nunca lo vuelve a
+# comprar cuando se lo enseñamos. El histórico se generó SIN ese efecto, así que el modelo aprendido de él
+# tiende a recomendar justo lo ya comprado. Aquí se manda al fondo de la lista todo lo que el usuario
+# compró (histórico + eventos en vivo + nuestras propias recomendaciones).
+REBUY_PENALTY = float(os.environ.get("REBUY_PENALTY", 0.02))
 FINAL_START = fc.parse_ts(os.environ.get("FINAL_START_UTC", "2026-11-15T09:00:00Z")) or 0.0
 MAX_FULL_BATCH = 5       # con más peticiones en el lote se usa "cand" para proteger la latencia
 WIDE_POOL = 150
@@ -116,7 +125,7 @@ class Ranker:
         self.direct = lgb.Booster(model_str=bundle["direct"]) if bundle.get("direct") and self.combine in ("direct", "blend") else None
         self.vocab = bundle.get("vocab", {})
         self.version = str(bundle.get("version", "lgb"))
-        self.full_default = bool(bundle.get("full_catalog", False))   # lo que dijo la validación offline
+        self.wide_default = bool(bundle.get("wide_pool", False))   # lo que dijo la validación offline
         self.cache_blocks = set(bundle.get("cache_blocks", [])) - {"vistas diarias"}
 
     @classmethod
@@ -163,7 +172,7 @@ def rank_batch(cache: FeatureCache, ranker: Ranker | None, recs: list[dict], arm
                     full_pool = cache.all_candidates()
                 cands = full_pool
             else:
-                cands = cache.candidates(R, S)
+                cands = cache.candidates(R, S, wide=arm == "wide")
             prepared.append((R, cands, cache.featurize(R, S, cands, ranker.vocab)))
         except Exception as e:  # noqa: BLE001  una petición rara no tumba el lote
             log(f"petición {rec.get('request_id')} no procesable: {str(e)[:150]}")
@@ -240,6 +249,8 @@ class Engine:
         self.req_items: OrderedDict[str, tuple] = OrderedDict()   # lo que enviamos, para contrastar con el feedback
         self.srv_latency: list[float] = []
         self._last_loop = time.time()
+        self.pushers = ThreadPoolExecutor(max_workers=3, thread_name_prefix="push")
+        self.slow_until = 0.0
         try:
             self.fb_modes = {k: list(v) for k, v in json.loads(STATE_PATH.read_text()).items()}
             log(f"estadísticas en vivo recuperadas de {STATE_PATH.name} ({len(self.fb_modes)} etiquetas)")
@@ -283,7 +294,7 @@ class Engine:
         ranker.score(np.zeros((2, fc.NF), np.float32))  # prueba de humo antes de publicarlo
         self.ranker = ranker
         log(f"modelo cargado: {ranker.version} (puntuación: {ranker.combine}; "
-            f"validación offline prefiere {'full' if ranker.full_default else 'cand'})")
+            f"validación offline prefiere {'wide' if ranker.wide_default else 'cand'})")
 
     def consistency_warning(self) -> str:
         """El modelo solo vale si la caché en servicio tiene los MISMOS bloques con los que se entrenó.
@@ -326,7 +337,8 @@ class Engine:
                 cache.set_oos_fast(self.unavailable)
                 for name, fn in (("catálogo", cache.refresh_catalog), ("tendencias", cache.refresh_trending),
                                  ("co-views en directo", cache.refresh_live_coviews),
-                                 ("perfil de usuario en directo", cache.refresh_user_events)):
+                                 ("perfil de usuario en directo", cache.refresh_user_events),
+                                 ("compras hechas con nuestras recomendaciones", cache.load_own_purchases)):
                     try:
                         fn()
                     except Exception as e:  # noqa: BLE001
@@ -351,7 +363,7 @@ class Engine:
         """Lanza otro script del proyecto en un proceso aparte, con prioridad baja y salida a logs/."""
         fc.LOG_DIR.mkdir(parents=True, exist_ok=True)
         out = open(fc.LOG_DIR / (Path(script).stem + ".out"), "a", encoding="utf-8")
-        env = dict(os.environ, TRAIN_THREADS=str(max(1, (os.cpu_count() or 2) // 2)), PYTHONIOENCODING="utf-8")
+        env = dict(os.environ, TRAIN_THREADS=str(max(1, (os.cpu_count() or 2) // 2 - 1)), PYTHONIOENCODING="utf-8")
         flags = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
         proc = subprocess.Popen([sys.executable, str(HERE / script), *args], cwd=str(HERE), env=env,
                                 stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
@@ -453,36 +465,40 @@ class Engine:
 
     # --- brazos del A/B ------------------------------------------------------------------------
     def arm_stats(self) -> dict[str, list[int]]:
-        """Conversión real acumulada de cada brazo, solo con respuestas de explotación (sin '+')."""
-        agg = {"full": [0, 0, 0], "cand": [0, 0, 0]}
+        """Compras reales acumuladas de cada brazo, solo con respuestas de explotación (sin '+')."""
+        agg = {"wide": [0, 0, 0], "cand": [0, 0, 0], "full": [0, 0, 0]}
         for label, st in self.fb_modes.items():
-            if label.startswith("v3-") and "+" not in label:
+            if "+" not in label:
                 arm = label.rsplit("-", 1)[-1]
                 if arm in agg:
-                    agg[arm] = [a + b for a, b in zip(agg[arm], st)]
+                    agg[arm] = [a + b for a, b in zip(agg[arm], st[:3])]
         return agg
 
     def choose_final_arm(self) -> str:
-        if ARM in ("full", "cand"):
+        if ARM in ("full", "cand", "wide"):
             return ARM
+        if time.time() < self.slow_until:
+            log("FINAL · el equipo va justo de latencia: brazo cand (retrieval rápido)")
+            return "cand"
         agg = self.arm_stats()
-        (nf, _, bf), (nc, _, bc) = agg["full"], agg["cand"]
-        if nf >= 3000 and nc >= 3000:
-            arm = "full" if bf / nf >= bc / nc else "cand"
+        (nw, _, bw), (nc, _, bc) = agg["wide"], agg["cand"]
+        if nw >= 3000 and nc >= 3000:
+            arm = "wide" if bw / nw > bc / nc else "cand"
             log(f"FINAL · brazo elegido por conversión en vivo: {arm} "
-                f"(full {100 * bf / nf:.2f}% con n={nf}; cand {100 * bc / nc:.2f}% con n={nc})")
+                f"(wide {100 * bw / nw:.2f}% con n={nw}; cand {100 * bc / nc:.2f}% con n={nc})")
         else:
-            arm = "full" if (self.ranker is not None and self.ranker.full_default) else "cand"
-            log(f"FINAL · pocos datos del A/B en vivo (full n={nf}, cand n={nc}): brazo según validación offline: {arm}")
+            arm = "wide" if (self.ranker is not None and self.ranker.wide_default) else "cand"
+            log(f"FINAL · pocos datos del A/B en vivo (wide n={nw}, cand n={nc}): brazo según validación offline: {arm}")
         return arm
 
     def public_label(self, internal: str) -> str:
-        """Nombre público corto: v6a = catálogo completo, v6b = retrieval, v6h = control, v60 = best sellers;
+        """Nombre público corto: v7b = retrieval (~80 candidatos), v7w = retrieval amplio (~250), v7a = catálogo
+        completo, v7h = control, v70 = best sellers;
         una x al final marca las respuestas de exploración. El marcador da la conversión ESPERADA de cada
         nombre (mucho menos ruidosa que nuestras compras reales): es la mejor vara de medir el A/B."""
         if internal.startswith("holdout"):
             return PUBLIC_NAME + "h"
-        base = "a" if "-full" in internal else "b" if "-cand" in internal else "0"
+        base = "a" if "-full" in internal else "b" if "-cand" in internal else "w" if "-wide" in internal else "0"
         return PUBLIC_NAME + base + ("x" if "+" in internal else "")
 
     def finalize(self, items: list[str] | None) -> list[str] | None:
@@ -530,10 +546,10 @@ class Engine:
                     arms.append(self.final_arm)
                     explore.append(None)
                 else:
-                    arms.append(ARM if ARM in ("full", "cand") else ("full" if (h >> 8) & 1 else "cand"))
+                    arms.append(ARM if ARM in ("full", "cand", "wide") else ("wide" if (h >> 8) & 1 else "cand"))
                     u = self.rng.random()
                     explore.append("shuf" if u < EXPLORE_RATE / 2 else "wide" if u < EXPLORE_RATE else None)
-        if len(todo) > MAX_FULL_BATCH:       # lote grande (atasco): retrieval para todos, la latencia manda
+        if len(todo) > MAX_FULL_BATCH or t0 < self.slow_until:   # atasco o equipo lento: la latencia manda
             arms = ["cand"] * len(todo)
         if todo:
             try:
@@ -567,6 +583,17 @@ class Engine:
         return answers
 
     def push(self, answers: list[dict], recs_ts: dict[str, float]) -> None:
+        """Envío en segundo plano: el bucle vuelve a leer peticiones sin esperar a que termine el insert."""
+        self.pushers.submit(self._push_now, answers, recs_ts)
+
+    def _push_now(self, answers: list[dict], recs_ts: dict[str, float]) -> None:
+        try:
+            self._push_sync(answers, recs_ts)
+        except Exception as e:  # noqa: BLE001
+            self.stats["push_perdidos"] += len(answers)
+            log(f"push perdido tras reintento ({len(answers)} respuestas): {str(e)[:160]}")
+
+    def _push_sync(self, answers: list[dict], recs_ts: dict[str, float]) -> None:
         if self.dry_run:
             log(f"[dry-run] {len(answers)} respuestas, p.ej. {answers[0]}")
         else:
@@ -598,6 +625,16 @@ class Engine:
                 line += (f" · latencia según el organizador p50 {np.percentile(lat, 50):.0f} ms "
                          f"p95 {np.percentile(lat, 95):.0f} ms")
         log(line)
+        # guardia de latencia: si el cómputo o la latencia medida suben, el catálogo completo se apaga 15 min
+        comp50 = float(np.percentile(self.compute_ms or [0], 50))
+        lat95 = float(np.percentile(self.srv_latency, 95)) if len(self.srv_latency) >= 20 else 0.0
+        if ARM != "cand" and (comp50 > SLOW_COMPUTE_MS or lat95 > SLOW_P95_MS):
+            if time.time() >= self.slow_until:
+                log(f"   LATENCIA ALTA (cómputo p50 {comp50:.0f} ms, p95 organizador {lat95:.0f} ms): "
+                    f"paso todo a retrieval rápido durante 15 min")
+            self.slow_until = time.time() + 900
+        elif lat95 > SLOW_P95_MS:
+            log(f"   LATENCIA ALTA (p95 organizador {lat95:.0f} ms) ya en modo rápido: es la red o el equipo, no el modelo")
         if w["no_vistas"]:
             log(f"   ATENCIÓN: {w['no_vistas']} peticiones llegaron y no las contestamos (bucle parado o red caída)")
         if w["ajenas"]:
@@ -613,7 +650,7 @@ class Engine:
             log(warn)
         if self.fb_modes:
             agg = self.arm_stats()
-            groups = {"A/B full": agg["full"], "A/B cand": agg["cand"]}
+            groups = {"A/B wide": agg["wide"], "A/B cand": agg["cand"], "full": agg["full"]}
             for key in ("holdout-baseline", "cold", "fallback-organizador"):
                 if key in self.fb_modes:
                     groups[key] = self.fb_modes[key]
@@ -695,7 +732,7 @@ class Engine:
             except Exception as e:  # noqa: BLE001  seguir vivos: los compradores llegan mientras dormimos
                 log(f"error en el bucle: {str(e)[:200]}")
                 time.sleep(0.3)
-            time.sleep(max(0.05, POLL - (time.time() - t0)))
+            time.sleep(max(0.03, POLL - (time.time() - t0)))
 
 
 def keep_awake() -> None:

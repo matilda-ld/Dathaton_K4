@@ -405,6 +405,12 @@ SELECT ts, event_type, user_id, product_id
 FROM {table}
 WHERE (event_type = 'add_to_cart' OR event_type = 'purchase'){and_since} AND {chunk}"""
 
+SQL_OWN_PURCHASES = f"""
+SELECT r.user_id::String AS user_id, f.purchased::String AS product_id
+FROM {TEAM}.feedback AS f
+INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String
+WHERE f.purchased != '' AND f.request_id != '__init__'"""
+
 SQL_LIVE_PURCHASES_ALL = """
 SELECT user_id::String AS user_id, product_id::String AS product_id
 FROM shop.events WHERE event_type = 'purchase'
@@ -1182,6 +1188,14 @@ class FeatureCache:
             return n
         return self.load_user_events("shop.events", incremental=True)
 
+    def load_own_purchases(self) -> int:
+        """Compras conseguidas con NUESTRAS recomendaciones (feedback ⨝ requests): también cuentan como
+        'ya comprado' para ese usuario. Se cargan al arrancar; después las añade el lector de feedback."""
+        rows = query(SQL_OWN_PURCHASES, timeout=60, name="own_purchases")
+        for r in rows:
+            self.add_purchase(str(r.get("user_id") or ""), str(r.get("product_id") or ""))
+        return len(rows)
+
     def add_purchase(self, user_id: str, pid: str) -> None:
         idx = self.pid2idx.get(pid)
         if idx is not None and user_id:
@@ -1329,50 +1343,55 @@ class FeatureCache:
             S.acc_ucov = acc
         return S
 
-    def candidates(self, R: Request, S: Session) -> np.ndarray:
+    def candidates(self, R: Request, S: Session, wide: bool = False) -> np.ndarray:
         """~50-90 candidatos en stock, mezclando todas las fuentes de retrieval."""
         n = self.n
+        m = 3 if wide else 1        # 'wide': el triple de candidatos por fuente (~250 en total)
         parts: list[np.ndarray] = []
         if S.uniq.size:
             parts.append(S.uniq)                                   # lo que acaba de ver
-            parts.append(_topk(S.acc_buy[:n], K_BUY))              # vieron esto → compraron aquello
-            parts.append(_topk(S.acc_cov[:n], K_COV))              # co-vistos (histórico + en directo)
+            parts.append(_topk(S.acc_buy[:n], K_BUY * m))              # vieron esto → compraron aquello
+            parts.append(_topk(S.acc_cov[:n], K_COV * m))              # co-vistos (histórico + en directo)
             if self.text_ok:                                       # parecidos por texto (cubre productos nuevos)
                 T = (self.E[:n] @ S.Ev.T) * S.decays[None, :]
-                parts.append(_topk(T.max(axis=1), K_TXT))
+                parts.append(_topk(T.max(axis=1), K_TXT * m))
             for v in S.uniq[:2].tolist():                          # top de sus subcategorías / categorías
                 tb = self.top_by_sub.get(int(self.sub[v]))
                 if tb is not None:
-                    parts.append(tb[:K_SUB])
+                    parts.append(tb[:K_SUB * m])
                 new = self.new_by_sub.get(int(self.sub[v]))
                 if new:
-                    parts.append(np.asarray(new[-K_NEW:], np.int64))
+                    parts.append(np.asarray(new[-K_NEW * m:], np.int64))
             tc = self.top_by_cat.get(int(self.cat[S.last]))
             if tc is not None:
-                parts.append(tc[:K_CAT])
+                parts.append(tc[:K_CAT * m])
         if S.cart_idx.size:                                        # lo que tiene en el carrito y sus vecinos
             parts.append(S.cart_idx[-8:])
         if S.acc_ucov is not None:
-            parts.append(_topk(S.acc_ucov[:n], 12))
+            parts.append(_topk(S.acc_ucov[:n], 12 * m))
         if S.acc_ucf is not None:                                  # quien compró lo mismo que él también compró…
-            parts.append(_topk(S.acc_ucf[:n], 15))
+            parts.append(_topk(S.acc_ucf[:n], 15 * m))
         if S.acc_scf is not None:                                  # …y quien compró lo que está viendo
-            parts.append(_topk(S.acc_scf[:n], 15))
+            parts.append(_topk(S.acc_scf[:n], 15 * m))
         if S.mf_u is not None:
-            parts.append(_topk(self.MF[:n] @ S.mf_u, 10))
+            parts.append(_topk(self.MF[:n] @ S.mf_u, 10 * m))
         aff = self.user_aff.get(R.user_id)
         if aff:
             for code, _ in aff[:2]:
                 tc = self.top_by_cat.get(code)
                 if tc is not None:
-                    parts.append(tc[:K_USER])
-        parts.append(self.trend_top[:K_TREND])
-        parts.append(self.top_global[:K_GLOBAL])
+                    parts.append(tc[:K_USER * m])
+        parts.append(self.trend_top[:K_TREND * m])
+        parts.append(self.top_global[:K_GLOBAL * m])
         allc = np.concatenate(parts).astype(np.int64)
         _, first = np.unique(allc, return_index=True)
         cands = allc[np.sort(first)]
         cands = cands[cands < n]
         cands = cands[self.avail[cands]]
+        if S.bought.size:      # lo ya comprado casi nunca se vuelve a comprar: fuera, si queda con qué llenar
+            fresh = cands[~np.isin(cands, S.bought)]
+            if fresh.size >= 15:
+                cands = fresh
         if cands.size < 15:  # red de seguridad: completar con lo más vendido disponible
             extra = self.top_global[self.avail[self.top_global]]
             if extra.size < 15:
@@ -1523,6 +1542,7 @@ def smoke_check() -> int:
         "trending_simple": SQL_TRENDING_SIMPLE + " LIMIT 3",
         "live_coviews": SQL_LIVE_COVIEWS.replace("LIMIT 20 BY p", "LIMIT 1 BY p LIMIT 3"),
         "live_purchases": SQL_LIVE_PURCHASES_RECENT + " LIMIT 3",
+        "own_purchases": SQL_OWN_PURCHASES + " LIMIT 3",
         "user_sub_aff": SQL_USER_SUB_AFF.replace("{and_until_e}", "").replace(
             "{chunk}", "cityHash64(e.user_id::String) % 3000 = 0") + " LIMIT 3",
         "user_brand_aff": SQL_USER_BRAND_AFF.replace("{and_until_e}", "").replace(
