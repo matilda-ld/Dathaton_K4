@@ -1,26 +1,4 @@
-# Backup
-_backup_loose/
-*.zip
-
-# Python & Jupyter
+.env
 __pycache__/
-*.py[cod]
-*$py.class
 .ipynb_checkpoints/
-*.pkl
-*.joblib
-
-# Virtual environments
-.env/
-env/
-venv/
-ENV/
-
-# Large datasets (comment out if using Git LFS or if you wish to push datasets < 50MB)
-data/
-*.csv
-
-# OS & Editor
-.DS_Store
-Thumbs.db
-.vscode/
+.venv/
