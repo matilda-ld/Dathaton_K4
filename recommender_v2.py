@@ -1,16 +1,51 @@
-"""recommender_v2.py · Recomendador v4-apex (team_40): ~100% On-Time + Máxima Conversión y Cold Start.
+"""recommender_v2.py · recomendador de producción (team_40) · versión 3: "la práctica es un laboratorio".
 
-    python recommender_v2.py             # Producción
-    python recommender_v2.py --dry-run   # Prueba sin insertar
+    python recommender_v2.py             # producción
+    python recommender_v2.py --dry-run   # calcula respuestas pero NO las inserta
+
+Idea central
+------------
+La ronda de práctica NO puntúa; solo cuentan las 2 horas finales. Así que hasta el domingo a las
+10:00 el sistema no intenta maximizar ventas: hace EXPERIMENTOS contra el simulador real para
+aprender cómo decide, y en la final explota lo aprendido.
+
+  1. A/B en vivo de dos formas de elegir candidatos (50/50 por hash de la petición):
+       · "full": el modelo puntúa TODO el catálogo disponible (~5.000 productos, ~40 ms).
+       · "cand": retrieval clásico (~60-90 candidatos) + re-ranking.
+     La conversión real de cada brazo sale de team_NN.feedback y se guarda en state/live_stats.json.
+     Al empezar la final se elige solo el brazo ganador.
+  2. Exploración diseñada (EXPLORE_RATE de las peticiones, mitad y mitad):
+       · "+shuf": el top-10 del modelo en orden aleatorio → mide el efecto de la posición sin
+         confundirlo con la relevancia.
+       · "+wide": 10 productos muestreados del top-150 (más uno al azar del catálogo), en orden
+         aleatorio → etiquetas del simulador real sobre productos que nadie más está enseñando.
+  3. train_model.py --loop reentrena cada hora con ese feedback (que es el modelo oculto, no el
+     log del sistema antiguo) y este proceso recarga el modelo en caliente.
+  4. Desde FINAL_START_UTC (domingo 10:00 CET): sin exploración, sin grupo de control, brazo ganador.
+
+Degradación: modelo LightGBM → best sellers en stock (= baseline). Nunca se responde algo inválido.
+
+Por defecto va a por el marcador: exploración y grupo de control apagados (se reactivan con
+EXPLORE_RATE=0.3 y HOLDOUT=0.02). El A/B entre "full" y "cand" sigue activo porque no cuesta conversión.
+
+El `model_version` que aparece en el marcador es siempre el mismo (PUBLIC_NAME, por defecto "v4_k4"):
+no revela la estrategia. Los brazos y modos se siguen distinguiendo en las estadísticas internas.
+
+Variables de entorno: EXPLORE_RATE (0), HOLDOUT (0), PUBLIC_NAME, ARM (ab | full | cand; por defecto ab en
+práctica y automático en la final), REBUY_PENALTY (1.0 = decide el modelo), FINAL_START_UTC,
+MODEL_PATH, CACHE_DIR, POLL_SECONDS (0.25).
 """
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import random
+import subprocess
 import sys
 import threading
 import time
+import zlib
 from collections import Counter, OrderedDict
 from pathlib import Path
 
@@ -21,55 +56,68 @@ from features_cache import F, FeatureCache, log
 
 HERE = Path(__file__).resolve().parent
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", HERE / "models" / "ranker.pkl"))
-POLL = float(os.environ.get("POLL_SECONDS", 0.12))
-MAX_AGE = 2.65
-EXPLORE_EPS = float(os.environ.get("EXPLORE_EPS", 0.015))
-REBUY_PENALTY = float(os.environ.get("REBUY_PENALTY", 0.25))
-REVENUE_ALPHA = float(os.environ.get("REVENUE_ALPHA", 0.04))   # Tie-breaker suave: no distorsiona el Top 1
+STATE_PATH = Path(os.environ.get("STATE_PATH", HERE / "state" / "live_stats.json"))
+POLL = float(os.environ.get("POLL_SECONDS", 0.15))
+MAX_AGE = 6.0            # peticiones más viejas que esto ya han recibido el fallback: no se contestan
+EXPLORE_RATE = float(os.environ.get("EXPLORE_RATE", 0.0))
+HOLDOUT = float(os.environ.get("HOLDOUT", 0.0))
+PUBLIC_NAME = os.environ.get("PUBLIC_NAME", "v6")   # prefijo del model_version que aparece en el marcador
+LABELS_PATH = STATE_PATH.with_name("labels.json")
+ARM = os.environ.get("ARM", "ab").lower()
+REBUY_PENALTY = float(os.environ.get("REBUY_PENALTY", 1.0))
 FINAL_START = fc.parse_ts(os.environ.get("FINAL_START_UTC", "2026-11-15T09:00:00Z")) or 0.0
+MAX_FULL_BATCH = 5       # con más peticiones en el lote se usa "cand" para proteger la latencia
+WIDE_POOL = 150
+PRED_THREADS = max(1, min(4, (os.cpu_count() or 2) - 1))
+AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "1") != "0"      # lanza y vigila train_model.py --loop en otro proceso
+INPROC_BUILD = os.environ.get("INPROC_BUILD", "0") == "1"  # solo para pruebas
+TRAIN_EVERY_MIN = int(os.environ.get("TRAIN_EVERY_MIN", 60))
 
 SQL_BEST_SELLERS = """
-SELECT product_id::String AS product_id, count() AS n
+SELECT product_id, count() AS n
 FROM shop.history_events
 WHERE event_type = 'purchase'
-GROUP BY product_id
-ORDER BY n DESC, product_id DESC
-LIMIT 200"""
+GROUP BY product_id"""
 
+SQL_NEW_REQUESTS = """
+SELECT request_id, ts, user_id, is_new_user, context, recent_views
+FROM shop.requests
+ORDER BY ts DESC
+LIMIT 60"""
+SQL_NEW_REQUESTS_ALT = "SELECT * FROM shop.requests ORDER BY ts DESC LIMIT 60"
+# lectura en ventana corta: no ordena toda la tabla, así que cada vuelta del bucle es más rápida
 SQL_NEW_REQUESTS_FAST = """
 SELECT request_id, ts, user_id, is_new_user, context, recent_views
 FROM shop.requests
 WHERE ts > now() - INTERVAL 8 SECOND
 ORDER BY ts DESC
-LIMIT 45"""
-
-SQL_NEW_REQUESTS_FALLBACK = """
-SELECT request_id, ts, user_id, is_new_user, context, recent_views
-FROM shop.requests
-ORDER BY ts DESC
-LIMIT 45"""
+LIMIT 60"""
 
 SQL_FEEDBACK_RECENT = f"""
-SELECT request_id, shown, served_by, fallback_reason, clicked, purchased, latency_ms, revenue_eur
+SELECT request_id, ts, shown, served_by, fallback_reason, clicked, purchased, latency_ms
 FROM {fc.TEAM}.feedback
 WHERE ts > now() - INTERVAL 3 MINUTE AND request_id != '__init__'"""
 
 
 # ----------------------------------------------------------------------------------------------
-# Ranking v4-apex (Conversión Pura + Live Stream Boost + Cold Start Inteligente)
+# Ranking
 # ----------------------------------------------------------------------------------------------
 class Ranker:
+    """Modelo LightGBM entrenado por train_model.py."""
+
     def __init__(self, bundle: dict) -> None:
         import lightgbm as lgb
 
         if bundle.get("features") != fc.FEATURES:
             raise RuntimeError("el modelo se entrenó con otra lista de features: vuelve a entrenar")
+        self.combine = str(bundle.get("combine", "click"))
         self.click = lgb.Booster(model_str=bundle["click"])
-        use_buy = bundle.get("buy") and bundle.get("combine") in ("click_x_buy", "ensemble")
-        self.buy = lgb.Booster(model_str=bundle["buy"]) if use_buy else None
-        self.direct_buy = lgb.Booster(model_str=bundle["direct_buy"]) if bundle.get("direct_buy") else None
+        self.buy = lgb.Booster(model_str=bundle["buy"]) if bundle.get("buy") and self.combine in ("click_x_buy", "blend") else None
+        self.direct = lgb.Booster(model_str=bundle["direct"]) if bundle.get("direct") and self.combine in ("direct", "blend") else None
         self.vocab = bundle.get("vocab", {})
         self.version = str(bundle.get("version", "lgb"))
+        self.full_default = bool(bundle.get("full_catalog", False))   # lo que dijo la validación offline
+        self.cache_blocks = set(bundle.get("cache_blocks", [])) - {"vistas diarias"}
 
     @classmethod
     def load(cls, path: Path | str = MODEL_PATH) -> "Ranker":
@@ -77,122 +125,91 @@ class Ranker:
             return cls(pickle.load(f))
 
     def score(self, X: np.ndarray) -> np.ndarray:
-        p_click = np.clip(self.click.predict(X, num_threads=2), 1e-6, 1.0)
-        if self.buy is not None:
-            p_cond = np.clip(self.buy.predict(X, num_threads=2), 1e-6, 1.0)
-            # P(compra) = P(clic) * P(compra | clic)^0.85 (suaviza la varianza de pocas compras)
-            p = p_click * (p_cond ** 0.85)
+        """P(compra) según la combinación que ganó en validación (train_model.py la elige)."""
+        th = PRED_THREADS if len(X) > 2000 else 1
+        if self.combine == "direct" and self.direct is not None:
+            p = self.direct.predict(X, num_threads=th)
         else:
-            p = p_click
-        if self.direct_buy is not None:
-            p_dir = np.clip(self.direct_buy.predict(X, num_threads=2), 1e-6, 1.0)
-            # Media geométrica ponderada: preserva probabilidades calibradas sin que una domine
-            p = (p ** 0.65) * (p_dir ** 0.35)
+            p = self.click.predict(X, num_threads=th)
+            if self.buy is not None:
+                p = p * self.buy.predict(X, num_threads=th)
+            if self.combine == "blend" and self.direct is not None:
+                p = np.sqrt(np.maximum(p, 1e-12) * np.maximum(self.direct.predict(X, num_threads=th), 1e-12))
         return np.nan_to_num(np.asarray(p, np.float64), nan=0.0)
 
 
-def heuristic_score(X: np.ndarray) -> np.ndarray:
-    return (2.2 * X[:, F["view_recency"]]
-            + 7.0 * X[:, F["buy_score"]]
-            + 4.5 * X[:, F["cov_score"]]
-            + 1.6 * np.maximum(X[:, F["text_max"]], 0)
-            + 0.6 * X[:, F["same_sub_last"]]
-            + 0.25 * X[:, F["same_cat_last"]]
-            + 0.6 * X[:, F["user_cat_aff"]]
-            + 0.28 * X[:, F["pop_purch"]]
-            + 22.0 * X[:, F["car_cvr"]]
-            + 0.20 * np.minimum(X[:, F["trend_lift"]], 4.0)).astype(np.float64)
+def rank_batch(cache: FeatureCache, ranker: Ranker | None, recs: list[dict], arms: list[str] | None = None,
+               explore: list[str | None] | None = None, rng: random.Random | None = None,
+               ) -> list[tuple[list[str] | None, str, object]]:
+    """Ranking de un lote → [(10 product_ids | None, etiqueta de versión, Request | None)].
 
-
-def rank_batch(cache: FeatureCache, ranker: Ranker | None, recs: list[dict], explore_eps: float = 0.0,
-               rng: random.Random | None = None) -> list[tuple[list[str] | None, str, object]]:
+    arms[i]    : "full" (todo el catálogo) o "cand" (retrieval + re-ranking).
+    explore[i] : None (explotar), "shuf" (top-10 barajado) o "wide" (muestreo del top-150 barajado).
+    Sin modelo devuelve None: el llamante responde best sellers.
+    """
+    n = len(recs)
+    arms = arms or ["cand"] * n
+    explore = explore or [None] * n
+    if ranker is None:
+        return [(None, "v3-bestsellers", None)] * n
     prepared: list[tuple | None] = []
-    vocab = ranker.vocab if ranker is not None else None
-    for rec in recs:
+    full_pool = None
+    for rec, arm in zip(recs, arms):
         try:
             R = cache.parse_request(rec)
             S = cache.session(R)
-            cands = cache.candidates(R, S)
-            prepared.append((R, S, cands, cache.featurize(R, S, cands, vocab)))
-        except Exception as e:  # noqa: BLE001
-            log(f"petición {rec.get('request_id')} no procesable: {str(e)[:120]}")
+            if arm == "full":
+                if full_pool is None:
+                    full_pool = cache.all_candidates()
+                cands = full_pool
+            else:
+                cands = cache.candidates(R, S)
+            prepared.append((R, cands, cache.featurize(R, S, cands, ranker.vocab)))
+        except Exception as e:  # noqa: BLE001  una petición rara no tumba el lote
+            log(f"petición {rec.get('request_id')} no procesable: {str(e)[:150]}")
             prepared.append(None)
-
     ok = [p for p in prepared if p is not None]
-    scores_all, mode = None, "v4-heur"
-    if ok:
-        X_all = np.vstack([p[3] for p in ok])
-        if ranker is not None:
-            try:
-                scores_all = ranker.score(X_all)
-                mode = f"v4-{ranker.version}"
-            except Exception as e:  # noqa: BLE001
-                log(f"fallo modelo LightGBM, uso heurístico: {str(e)[:120]}")
-        if scores_all is None:
-            scores_all = heuristic_score(X_all)
-
+    scores = ranker.score(np.vstack([p[2] for p in ok])) if ok else None
     out: list[tuple[list[str] | None, str, object]] = []
     off = 0
     pids = cache.pids
-    price_drop = cache.price_drop
-    live_buy = cache.live_buy_boost
-    prices = cache.price
-
-    for p in prepared:
+    for p, arm, exp in zip(prepared, arms, explore):
         if p is None:
             out.append((None, "error", None))
             continue
-        R, S, cands, X = p
-        k = len(cands)
-        s = np.array(scores_all[off: off + k], np.float64)
-        off += k
-
-        # 1. Multiplicador en tiempo real por Rebaja de Precio (Price Drop anunciado en catalog_updates)
-        if price_drop is not None:
-            drops = price_drop[cands]
-            # Si un producto bajó de precio, los compradores del simulador compran mucho más
-            s *= (1.0 + 1.10 * np.maximum(drops, 0.0))
-            # Si subió mucho de precio, ligera penalización
-            s *= (1.0 + 0.30 * np.minimum(drops, 0.0))
-
-        # 2. Multiplicador por Compras en Directo (Tendencia en shop.events últimos 90 min)
-        if live_buy is not None:
-            s *= (1.0 + 0.18 * live_buy[cands])
-
-        # 3. Cold Start Booster (Cuando el usuario ve un producto nuevo o no tiene historial):
-        #    Los árboles de LightGBM a veces infra-puntúan is_new_item=1; aquí usamos similitud de texto y co-views vivos
-        if R.cold:
-            new_mask = X[:, F["is_new_item"]] > 0.5
-            if new_mask.any():
-                sim_boost = 1.0 + 0.35 * np.maximum(X[:, F["text_max"]], 0.0) + 0.25 * (X[:, F["cov_score"]] > 0)
-                s = np.where(new_mask, s * sim_boost, s)
-
-        # 4. Tie-breaker suave por Expected Revenue (solo desempata probabilidades cercanas)
-        if REVENUE_ALPHA > 0:
-            cand_prices = np.maximum(prices[cands], 1.0)
-            rev_mult = 1.0 + REVENUE_ALPHA * np.clip(np.log1p(cand_prices) / 4.0, 0.0, 1.0)
-            if S.mean_price > 0:
-                rev_mult = np.where(cand_prices > 3.0 * S.mean_price, 1.0, rev_mult)
-            s *= rev_mult
-
-        # 5. Penalizar productos que este usuario ya compró
-        s[X[:, F["user_bought"]] > 0] *= REBUY_PENALTY
-
-        order = np.argsort(-s, kind="stable")
-        top = cands[order[:10]].tolist()
-
-        m = mode
-        if explore_eps > 0 and rng is not None and len(order) > 12 and rng.random() < explore_eps:
-            pool = cands[order[10:22]].tolist()
-            fresh = [i for i in pool if i in cache.new_items]
-            top[-1] = rng.choice(fresh or pool)
-            m = mode + "+x"
-        out.append(([pids[i] for i in top], m, R))
+        R, cands, X = p
+        s = np.array(scores[off: off + len(cands)], np.float64)
+        off += len(cands)
+        if REBUY_PENALTY != 1.0:
+            s[X[:, F["user_bought"]] > 0] *= REBUY_PENALTY
+        k = min(len(s), WIDE_POOL if exp == "wide" else 10)
+        part = np.argpartition(-s, k - 1)[:k] if k < len(s) else np.arange(len(s))
+        order = part[np.argsort(-s[part], kind="stable")]
+        label = f"v3-{ranker.version}-{arm}"
+        if exp == "shuf" and rng is not None:
+            top = cands[order[:10]].tolist()
+            rng.shuffle(top)
+            label += "+shuf"
+        elif exp == "wide" and rng is not None and len(order) > 12:
+            w = 1.0 / (np.arange(len(order)) + 5.0) ** 0.8          # más peso a lo mejor puntuado
+            pick = np.random.default_rng(rng.getrandbits(32)).choice(len(order), size=9, replace=False, p=w / w.sum())
+            top = cands[order[pick]].tolist()
+            pool = full_pool if full_pool is not None else cache.all_candidates()
+            for _ in range(20):                                     # + 1 producto al azar del catálogo
+                extra = int(pool[rng.randrange(len(pool))])
+                if extra not in top:
+                    top.append(extra)
+                    break
+            rng.shuffle(top)
+            label += "+wide"
+        else:
+            top = cands[order[:10]].tolist()
+        out.append(([pids[i] for i in top], label, R))
     return out
 
 
 # ----------------------------------------------------------------------------------------------
-# Motor de Producción
+# Motor de producción
 # ----------------------------------------------------------------------------------------------
 class Engine:
     def __init__(self, dry_run: bool = False) -> None:
@@ -206,17 +223,50 @@ class Engine:
         self.stats: Counter = Counter()
         self.ages: list[float] = []
         self.compute_ms: list[float] = []
-        self.req_meta: OrderedDict[str, tuple[str, str, bool]] = OrderedDict()
+        self.req_meta: OrderedDict[str, tuple[str, str, bool]] = OrderedDict()  # request_id → (user, etiqueta, cold)
         self.fb_seen: OrderedDict[str, int] = OrderedDict()
-        self.fb_modes: dict[str, list[float]] = {}
+        self.fb_modes: dict[str, list[int]] = {}   # etiqueta → [peticiones, clics, compras]
         self.fb_window: Counter = Counter()
+        self.final_arm: str | None = None
+        self.public: dict[str, str] = {}
         self._last_report = time.time()
-        self._use_fast_sql = True
-        self._clock_offset = 0.0
+        self._req_sql = 0
+        self._pull_fail = 0
+        self._empty = 0
+        self._warned = ""
+        self.trainer = None
+        self._trainer_started = 0.0
+        self.started = time.time()
+        self.req_items: OrderedDict[str, tuple] = OrderedDict()   # lo que enviamos, para contrastar con el feedback
+        self.srv_latency: list[float] = []
+        self._last_loop = time.time()
+        try:
+            self.fb_modes = {k: list(v) for k, v in json.loads(STATE_PATH.read_text()).items()}
+            log(f"estadísticas en vivo recuperadas de {STATE_PATH.name} ({len(self.fb_modes)} etiquetas)")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- hilos en segundo plano -------------------------------------------------------------
+    def _spawn(self, name: str, fn, period: float) -> None:
+        def loop() -> None:
+            fails = 0
+            while True:
+                t = time.time()
+                try:
+                    fn()
+                    if fails:
+                        log(f"[{name}] recuperado")
+                    fails = 0
+                except Exception as e:  # noqa: BLE001
+                    fails += 1
+                    if fails in (1, 10) or fails % 100 == 0:
+                        log(f"[{name}] error ({fails} seguidos): {str(e)[:200]}")
+                time.sleep(max(0.05, period - (time.time() - t)))
+
+        threading.Thread(target=loop, name=name, daemon=True).start()
 
     def _refresh_stock(self) -> None:
-        rows = fc.query(fc.SQL_OUT_OF_STOCK, timeout=2.5, name="out_of_stock")
-        pids = {str(r["product_id"]) for r in rows}
+        pids = {str(r["product_id"]) for r in fc.query(fc.SQL_OUT_OF_STOCK, timeout=4, name="out_of_stock")}
         self.unavailable = pids
         cache = self.cache
         if cache is not None:
@@ -228,14 +278,107 @@ class Engine:
         mtime = MODEL_PATH.stat().st_mtime
         if mtime == self._model_mtime:
             return
-        self._model_mtime = mtime
+        self._model_mtime = mtime          # si el fichero no sirve no se reintenta hasta que cambie
         ranker = Ranker.load(MODEL_PATH)
-        ranker.score(np.zeros((2, fc.NF), np.float32))
+        ranker.score(np.zeros((2, fc.NF), np.float32))  # prueba de humo antes de publicarlo
         self.ranker = ranker
-        log(f"modelo cargado en caliente: {ranker.version}")
+        log(f"modelo cargado: {ranker.version} (puntuación: {ranker.combine}; "
+            f"validación offline prefiere {'full' if ranker.full_default else 'cand'})")
+
+    def consistency_warning(self) -> str:
+        """El modelo solo vale si la caché en servicio tiene los MISMOS bloques con los que se entrenó.
+        Servir con una caché parcial (sin co-views, sin compras por usuario…) deja esas features a cero
+        y hunde la conversión sin dar ningún error."""
+        cache, ranker = self.cache, self.ranker
+        if cache is None:
+            return ""
+        bad = sorted(k for k, v in cache.status.items() if v != "OK")
+        missing = sorted(ranker.cache_blocks - {k for k, v in cache.status.items() if v == "OK"}) if ranker else []
+        if bad or missing:
+            return (f"¡¡ CACHÉ INCOMPLETA !! bloques fallidos: {bad or '-'} · bloques que el modelo usa y faltan: "
+                    f"{missing or '-'} → para, ejecuta `python features_cache.py --build` y vuelve a arrancar")
+        return ""
+
+    def _init_cache(self) -> None:
+        while self.cache is None:
+            try:
+                cache = None
+                if fc.LIVE_CACHE_PATH.exists():
+                    try:
+                        cache = FeatureCache.load(fc.LIVE_CACHE_PATH)
+                        cache._upd_ts = 0.0               # fuerza una lectura completa de catalog_updates
+                        cache._ev_ts, cache.user_ev = 0.0, {}
+                        log(f"caché cargada de disco ({cache.n} productos)")
+                    except Exception as e:  # noqa: BLE001
+                        log(f"caché de disco no válida ({str(e)[:120]}): la reconstruyo")
+                if cache is None and INPROC_BUILD:
+                    cache = FeatureCache.build()
+                    cache.save(fc.LIVE_CACHE_PATH)
+                elif cache is None:
+                    # En OTRO proceso: construirla aquí dentro frenaría el bucle que responde peticiones.
+                    log("no hay caché: la construyo en un proceso aparte (1-2 min; mientras tanto, best sellers)…")
+                    rc = self._run_script("features_cache.py", ["--build"], wait=True)
+                    if rc != 0 or not fc.LIVE_CACHE_PATH.exists():
+                        raise RuntimeError(f"la construcción de la caché ha fallado (código {rc}): mira logs/features_cache.out")
+                    cache = FeatureCache.load(fc.LIVE_CACHE_PATH)
+                    cache._upd_ts = 0.0
+                    cache._ev_ts, cache.user_ev = 0.0, {}
+                cache.set_oos_fast(self.unavailable)
+                for name, fn in (("catálogo", cache.refresh_catalog), ("tendencias", cache.refresh_trending),
+                                 ("co-views en directo", cache.refresh_live_coviews),
+                                 ("perfil de usuario en directo", cache.refresh_user_events)):
+                    try:
+                        fn()
+                    except Exception as e:  # noqa: BLE001
+                        log(f"primer refresco de {name} fallido: {str(e)[:200]}")
+                if not self.best and cache.best:
+                    self.best = cache.best
+                self.cache = cache
+                log(f"caché en servicio: {cache.n} productos, {int(cache.avail.sum())} disponibles, "
+                    f"{len(cache.new_items)} nuevos")
+            except Exception as e:  # noqa: BLE001
+                log(f"no se pudo preparar la caché ({str(e)[:200]}); reintento en 30 s")
+                time.sleep(30)
+        cache = self.cache
+        self._spawn("catálogo", cache.refresh_catalog, 10)
+        self._spawn("tendencias", cache.refresh_trending, 60)
+        self._spawn("co-views", cache.refresh_live_coviews, 300)
+        self._spawn("perfil", cache.refresh_user_events, 2)
+        if AUTO_TRAIN and not self.dry_run:
+            self._spawn("entrenador", self._ensure_trainer, 30)
+
+    def _run_script(self, script: str, args: list[str], wait: bool):
+        """Lanza otro script del proyecto en un proceso aparte, con prioridad baja y salida a logs/."""
+        fc.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        out = open(fc.LOG_DIR / (Path(script).stem + ".out"), "a", encoding="utf-8")
+        env = dict(os.environ, TRAIN_THREADS=str(max(1, (os.cpu_count() or 2) // 2)), PYTHONIOENCODING="utf-8")
+        flags = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+        proc = subprocess.Popen([sys.executable, str(HERE / script), *args], cwd=str(HERE), env=env,
+                                stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
+        if wait:
+            return proc.wait()
+        return proc
+
+    def _ensure_trainer(self) -> None:
+        """Mantiene vivo `train_model.py --loop`: entrena al arrancar y cada hora con el feedback nuevo.
+        El propio entrenador se para solo 20 minutos antes de la final."""
+        if time.time() > FINAL_START - 20 * 60 > 0 and MODEL_PATH.exists():
+            return
+        proc = self.trainer
+        if proc is not None and proc.poll() is None:
+            return
+        if proc is not None and time.time() - self._trainer_started < 600:
+            return                                   # murió hace poco: no relanzar en bucle
+        if proc is not None:
+            log(f"el entrenador terminó (código {proc.returncode}); lo relanzo. Detalle en logs/train_model.out")
+        else:
+            log("lanzo el entrenamiento en un proceso aparte (5-10 min la primera vez; detalle en logs/train_model.out)"
+                + ("" if MODEL_PATH.exists() else " · AÚN NO HAY MODELO: hasta que acabe se responden best sellers"))
+        self._trainer_started = time.time()
+        self.trainer = self._run_script("train_model.py", ["--loop", str(TRAIN_EVERY_MIN)], wait=False)
 
     def _read_feedback(self) -> None:
-        rows = fc.query(SQL_FEEDBACK_RECENT, timeout=4.0, name="feedback")
+        rows = fc.query(SQL_FEEDBACK_RECENT, timeout=8, name="feedback")
         cache = self.cache
         for r in rows:
             rid = str(r.get("request_id"))
@@ -246,156 +389,111 @@ class Engine:
                 self.fb_seen.popitem(last=False)
             served = str(r.get("served_by") or "")
             clicked, purchased = fc.as_pid(r.get("clicked")), fc.as_pid(r.get("purchased"))
-            rev = fc.as_float(r.get("revenue_eur"), 0.0)
-            self.fb_window["n"] += 1
-            self.fb_window["team"] += served == "team"
-            if served != "team":
-                self.fb_window[f"fallback:{r.get('fallback_reason') or '?'}"] += 1
-
-            # Aprendizaje continuo del feedback: actualiza CTR/CVR de productos mostrados
-            if cache is not None:
-                get = cache.pid2idx.get
-                shown_idxs = [get(str(p)) for p in fc.as_list(r.get("shown"))]
-                shown_idxs = [i for i in shown_idxs if i is not None]
-                c_idx = get(clicked) if clicked else None
-                b_idx = get(purchased) if purchased else None
-                if shown_idxs:
-                    cache.update_feedback_stats(shown_idxs, c_idx, b_idx)
-
             meta = self.req_meta.get(rid)
             if meta is None:
+                fts = fc.parse_ts(r.get("ts"))
+                if fts is not None and fts > self.started + 12:
+                    self.fb_window["no_vistas"] += 1          # llegó mientras corríamos y no la contestamos
                 continue
-            user, mode, cold = meta
+            self.fb_window["n"] += 1
+            self.fb_window["team"] += served == "team"
+            if served == "team":
+                lat = fc.as_float(r.get("latency_ms"))
+                if lat == lat:
+                    self.srv_latency.append(lat)
+                ours = self.req_items.get(rid)
+                shown = tuple(str(p) for p in fc.as_list(r.get("shown")))
+                if ours is not None and shown and shown != ours:
+                    self.fb_window["ajenas"] += 1             # se mostró una lista que no es la nuestra
+            else:
+                reason = str(r.get("fallback_reason") or "?")
+                self.fb_window[f"fallback:{reason}"] += 1
+                if reason == "invalid" and self.fb_window["fallback:invalid"] <= 2:
+                    log(f"respuesta marcada como inválida: {rid} → {self.req_items.get(rid)}")
+            user, label, cold = meta
             if served != "team":
-                mode = "fallback-organizador"
-            for key in (mode, "cold" if cold and served == "team" else None):
+                label = "fallback-organizador"
+            for key in (label, "cold" if cold and served == "team" else None):
                 if key:
-                    st = self.fb_modes.setdefault(key, [0, 0, 0, 0.0])
+                    st = self.fb_modes.setdefault(key, [0, 0, 0])
                     st[0] += 1
                     st[1] += bool(clicked)
                     st[2] += bool(purchased)
-                    st[3] += rev
             if purchased and cache is not None:
                 cache.add_purchase(user, purchased)
 
-    def _background_scheduler(self) -> None:
-        last_cat = 0.0
-        last_model = 0.0
-        last_fb = 0.0
-        last_trend = 0.0
-        last_purch = 0.0
-        last_cov = 0.0
-
-        while True:
-            try:
-                self._refresh_stock()
-            except Exception as e:  # noqa: BLE001
-                log(f"[bg:stock] {str(e)[:140]}")
-
-            time.sleep(0.2)
-            now = time.time()
-
-            if now - last_model >= 10.0:
-                last_model = now
-                try:
-                    self._watch_model()
-                except Exception as e:  # noqa: BLE001
-                    log(f"[bg:model] {str(e)[:140]}")
-
-            if self.cache is not None and now - last_cat >= 8.0:
-                last_cat = now
-                try:
-                    self.cache.refresh_catalog()
-                except Exception as e:  # noqa: BLE001
-                    log(f"[bg:catalog] {str(e)[:140]}")
-                time.sleep(0.15)
-
-            if now - last_fb >= 15.0:
-                last_fb = now
-                try:
-                    self._read_feedback()
-                except Exception as e:  # noqa: BLE001
-                    log(f"[bg:feedback] {str(e)[:140]}")
-                time.sleep(0.15)
-
-            if self.cache is not None and now - last_trend >= 35.0:
-                last_trend = now
-                try:
-                    self.cache.refresh_trending()
-                except Exception as e:  # noqa: BLE001
-                    log(f"[bg:trending] {str(e)[:140]}")
-                time.sleep(0.15)
-
-            if self.cache is not None and now - last_purch >= 60.0:
-                last_purch = now
-                try:
-                    self.cache.refresh_live_purchases()
-                except Exception as e:  # noqa: BLE001
-                    log(f"[bg:purchases] {str(e)[:140]}")
-                time.sleep(0.15)
-
-            if self.cache is not None and now - last_cov >= 120.0:
-                last_cov = now
-                try:
-                    n_cov = self.cache.refresh_live_coviews()
-                    if n_cov > 0 and int(now) % 360 < 130:
-                        log(f"[bg:coviews] actualizados {n_cov} productos con co-views/compras en vivo")
-                except Exception as e:  # noqa: BLE001
-                    log(f"[bg:coviews] {str(e)[:140]}")
-
-            time.sleep(0.8)
-
     def bootstrap(self) -> None:
-        if fc.LIVE_CACHE_PATH.exists():
-            try:
-                log(f"cargando caché desde {fc.LIVE_CACHE_PATH}…")
-                cache = FeatureCache.load(fc.LIVE_CACHE_PATH)
-                self.cache = cache
-                self.best = list(cache.best)
-                log(f"caché cargada ({cache.n} productos)")
-            except Exception as e:  # noqa: BLE001
-                log(f"error cargando caché ({e})")
-
-        try:
-            self._watch_model()
-        except Exception as e:  # noqa: BLE001
-            log(f"aviso al cargar modelo inicial: {e}")
-
         while not self.best:
             try:
-                rows = fc.query(SQL_BEST_SELLERS, timeout=30, name="best_sellers")
-                self.best = [str(r["product_id"]) for r in rows]
-                log(f"best sellers listos ({len(self.best)} productos)")
+                rows = fc.query(SQL_BEST_SELLERS, timeout=120, name="best_sellers")
+                sales = sorted(((int(r["n"]), str(r["product_id"])) for r in rows), reverse=True)
+                self.best = [p for _, p in sales]
+                log(f"best sellers listos ({len(self.best)} productos): ya se responde en modo baseline")
             except Exception as e:  # noqa: BLE001
-                log(f"reintentando best_sellers en 1s ({str(e)[:120]})")
-                time.sleep(1.0)
-
+                log(f"no se pudieron leer los best sellers ({str(e)[:160]}); reintento en 2 s")
+                if fc.LIVE_CACHE_PATH.exists():
+                    try:
+                        self.best = FeatureCache.load(fc.LIVE_CACHE_PATH).best
+                        continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                time.sleep(2)
         try:
             self._refresh_stock()
         except Exception as e:  # noqa: BLE001
-            log(f"aviso stock inicial: {e}")
+            log(f"primer chequeo de stock fallido: {str(e)[:160]}")
+        try:
+            self._watch_model()
+        except Exception as e:  # noqa: BLE001
+            log(f"modelo no cargado: {str(e)[:160]}")
+        self._spawn("stock", self._refresh_stock, 1.0)
+        self._spawn("modelo", self._watch_model, 20)
+        self._spawn("feedback", self._read_feedback, 30)
+        threading.Thread(target=self._init_cache, name="cache-init", daemon=True).start()
 
-        if self.cache is not None:
-            for name, fn in (("catálogo", self.cache.refresh_catalog),
-                             ("tendencias", self.cache.refresh_trending),
-                             ("co-views en vivo", self.cache.refresh_live_coviews)):
-                try:
-                    fn()
-                except Exception as e:  # noqa: BLE001
-                    log(f"aviso {name} inicial: {e}")
-            log(f"caché lista en vivo: {self.cache.n} prods ({len(self.cache.new_items)} nuevos, "
-                f"{len(self.cache.cov_live)} con co-views en vivo)")
+    # --- brazos del A/B ------------------------------------------------------------------------
+    def arm_stats(self) -> dict[str, list[int]]:
+        """Conversión real acumulada de cada brazo, solo con respuestas de explotación (sin '+')."""
+        agg = {"full": [0, 0, 0], "cand": [0, 0, 0]}
+        for label, st in self.fb_modes.items():
+            if label.startswith("v3-") and "+" not in label:
+                arm = label.rsplit("-", 1)[-1]
+                if arm in agg:
+                    agg[arm] = [a + b for a, b in zip(agg[arm], st)]
+        return agg
 
-        threading.Thread(target=self._background_scheduler, name="bg-scheduler", daemon=True).start()
+    def choose_final_arm(self) -> str:
+        if ARM in ("full", "cand"):
+            return ARM
+        agg = self.arm_stats()
+        (nf, _, bf), (nc, _, bc) = agg["full"], agg["cand"]
+        if nf >= 3000 and nc >= 3000:
+            arm = "full" if bf / nf >= bc / nc else "cand"
+            log(f"FINAL · brazo elegido por conversión en vivo: {arm} "
+                f"(full {100 * bf / nf:.2f}% con n={nf}; cand {100 * bc / nc:.2f}% con n={nc})")
+        else:
+            arm = "full" if (self.ranker is not None and self.ranker.full_default) else "cand"
+            log(f"FINAL · pocos datos del A/B en vivo (full n={nf}, cand n={nc}): brazo según validación offline: {arm}")
+        return arm
+
+    def public_label(self, internal: str) -> str:
+        """Nombre público corto: v6a = catálogo completo, v6b = retrieval, v6h = control, v60 = best sellers;
+        una x al final marca las respuestas de exploración. El marcador da la conversión ESPERADA de cada
+        nombre (mucho menos ruidosa que nuestras compras reales): es la mejor vara de medir el A/B."""
+        if internal.startswith("holdout"):
+            return PUBLIC_NAME + "h"
+        base = "a" if "-full" in internal else "b" if "-cand" in internal else "0"
+        return PUBLIC_NAME + base + ("x" if "+" in internal else "")
 
     def finalize(self, items: list[str] | None) -> list[str] | None:
+        """Garantiza 10 IDs distintos, activos y en stock; completa con best sellers."""
         unavailable, cache = self.unavailable, self.cache
         out: list[str] = []
         seen: set[str] = set()
 
         def take(source) -> bool:
             for p in source:
-                if not p or p in seen or p in unavailable:
+                if p in seen or p in unavailable:
                     continue
                 if cache is not None and cache.is_available(p) is False:
                     continue
@@ -414,69 +512,153 @@ class Engine:
     def answer(self, recs: list[dict]) -> list[dict]:
         t0 = time.time()
         final = t0 >= FINAL_START > 0
-        eps = 0.0 if final else EXPLORE_EPS
-        cache = self.cache
-
-        if cache is None:
-            res = [(None, "v4-bestsellers", None)] * len(recs)
-        else:
+        if final and self.final_arm is None:
+            self.final_arm = self.choose_final_arm()
+        cache, ranker = self.cache, self.ranker
+        ranked: dict[int, tuple[list[str] | None, str, object]] = {}
+        todo, arms, explore = [], [], []
+        for i, rec in enumerate(recs):
+            rid = str(rec.get("request_id"))
+            h = zlib.crc32(rid.encode())
+            if not final and HOLDOUT > 0 and (h % 10000) < HOLDOUT * 10000:
+                ranked[i] = (None, "holdout-baseline", None)   # grupo de control: mide el uplift real
+            elif cache is None or ranker is None:
+                ranked[i] = (None, "v3-bestsellers", None)
+            else:
+                todo.append(i)
+                if final:
+                    arms.append(self.final_arm)
+                    explore.append(None)
+                else:
+                    arms.append(ARM if ARM in ("full", "cand") else ("full" if (h >> 8) & 1 else "cand"))
+                    u = self.rng.random()
+                    explore.append("shuf" if u < EXPLORE_RATE / 2 else "wide" if u < EXPLORE_RATE else None)
+        if len(todo) > MAX_FULL_BATCH:       # lote grande (atasco): retrieval para todos, la latencia manda
+            arms = ["cand"] * len(todo)
+        if todo:
             try:
-                res = rank_batch(cache, self.ranker, recs, eps, self.rng)
+                res = rank_batch(cache, ranker, [recs[i] for i in todo], arms, explore, self.rng)
             except Exception as e:  # noqa: BLE001
-                log(f"fallo ranking ({str(e)[:140]}), uso fallback interno")
-                res = [(None, "v4-bestsellers", None)] * len(recs)
-
+                log(f"fallo del ranking, respondo best sellers: {str(e)[:200]}")
+                res = [(None, "v3-bestsellers", None)] * len(todo)
+            for i, r in zip(todo, res):
+                ranked[i] = r
         answers = []
-        for rec, (items, mode, R) in zip(recs, res):
-            if items is None and mode == "error":
-                mode = "v4-bestsellers"
+        for i, rec in enumerate(recs):
+            items, label, R = ranked[i]
+            if items is None and label == "error":
+                label = "v3-bestsellers"
             items = self.finalize(items)
             if items is None:
                 self.stats["sin_respuesta"] += 1
                 continue
             rid = str(rec.get("request_id"))
-            answers.append({"request_id": rid, "items": items, "model_version": mode})
-            self.stats[mode] += 1
+            answers.append({"request_id": rid, "items": items, "model_version": self.public_label(label)})
+            self.stats[label] += 1
             cold = bool(R.cold) if R is not None else fc.as_bool(rec.get("is_new_user"), False)
             self.stats["cold"] += cold
-            self.req_meta[rid] = (str(rec.get("user_id") or ""), mode, cold)
+            self.req_meta[rid] = (str(rec.get("user_id") or ""), label, cold)
             if len(self.req_meta) > 60000:
                 self.req_meta.popitem(last=False)
-        self.compute_ms.append((time.time() - t0) * 1000.0)
+            self.req_items[rid] = tuple(items)
+            if len(self.req_items) > 20000:
+                self.req_items.popitem(last=False)
+        self.compute_ms.append((time.time() - t0) * 1000)
         return answers
 
     def push(self, answers: list[dict], recs_ts: dict[str, float]) -> None:
         if self.dry_run:
-            log(f"[dry-run] {len(answers)} respuestas · ej: {answers[0]}")
+            log(f"[dry-run] {len(answers)} respuestas, p.ej. {answers[0]}")
         else:
             try:
-                fc.insert("submissions", answers, timeout=2.2)
+                fc.insert("submissions", answers, timeout=2.5)
             except Exception as e:  # noqa: BLE001
-                log(f"push reintento ({str(e)[:120]})")
-                fc.insert("submissions", answers, timeout=2.2)
-        now = time.time() - self._clock_offset
+                log(f"push fallido ({str(e)[:160]}); reintento")
+                fc.insert("submissions", answers, timeout=2.5)
+        now = time.time()
         self.stats["respondidas"] += len(answers)
-        self.ages.extend(max(0.0, now - recs_ts[a["request_id"]]) for a in answers if a["request_id"] in recs_ts)
+        self.ages.extend(now - recs_ts[a["request_id"]] for a in answers if a["request_id"] in recs_ts)
+
+    def report(self) -> None:
+        if time.time() - self._last_report < 60:
+            return
+        self._last_report = time.time()
+        ages = np.asarray(self.ages or [0.0])
+        modes = {k: v for k, v in self.stats.items() if k.startswith(("v3", "holdout"))}
+        line = (f"respondidas {self.stats['respondidas']} · edad al responder p50 {np.percentile(ages, 50):.2f}s "
+                f"p95 {np.percentile(ages, 95):.2f}s · cómputo p50 {np.percentile(self.compute_ms or [0], 50):.0f} ms "
+                f"máx {np.max(self.compute_ms or [0]):.0f} ms · cold {self.stats['cold']} · "
+                f"sin stock {len(self.unavailable)} · {modes}")
+        w = self.fb_window
+        if w["n"]:
+            fb = {k: v for k, v in w.items() if k.startswith("fallback")}
+            line += f" · DE LO NUESTRO: {100 * w['team'] / w['n']:.1f}% válido y a tiempo {fb or ''}"
+            if self.srv_latency:
+                lat = np.asarray(self.srv_latency)
+                line += (f" · latencia según el organizador p50 {np.percentile(lat, 50):.0f} ms "
+                         f"p95 {np.percentile(lat, 95):.0f} ms")
+        log(line)
+        if w["no_vistas"]:
+            log(f"   ATENCIÓN: {w['no_vistas']} peticiones llegaron y no las contestamos (bucle parado o red caída)")
+        if w["ajenas"]:
+            log(f"   ATENCIÓN: en {w['ajenas']} peticiones se mostró una lista que NO es la nuestra: hay OTRO proceso "
+                f"respondiendo con la clave del equipo. Paradlo: se pisan y falsea el marcador.")
+        if self.ranker is None:
+            log("   SIN MODELO: se están respondiendo best sellers (= baseline). "
+                + ("El entrenamiento está en marcha; se cargará solo." if self.trainer is not None
+                   else "Hace falta ejecutar train_model.py."))
+        self.srv_latency = []
+        warn = self.consistency_warning()
+        if warn:
+            log(warn)
+        if self.fb_modes:
+            agg = self.arm_stats()
+            groups = {"A/B full": agg["full"], "A/B cand": agg["cand"]}
+            for key in ("holdout-baseline", "cold", "fallback-organizador"):
+                if key in self.fb_modes:
+                    groups[key] = self.fb_modes[key]
+            for suffix in ("+shuf", "+wide"):
+                st = [0, 0, 0]
+                for label, v in self.fb_modes.items():
+                    if label.endswith(suffix):
+                        st = [a + b for a, b in zip(st, v)]
+                groups["explora " + suffix] = st
+            log("   conversión real acumulada: " + " | ".join(
+                f"{k}: n={n} ctr={100 * c / n:.1f}% conv={100 * b / n:.2f}%" for k, (n, c, b) in groups.items() if n))
+            try:
+                STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = STATE_PATH.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self.fb_modes))
+                os.replace(tmp, STATE_PATH)
+            except Exception:  # noqa: BLE001
+                pass
+        self.stats = Counter({k: v for k, v in self.stats.items() if k == "respondidas"})
+        self.ages, self.compute_ms, self.fb_window = [], [], Counter()
 
     def pull(self, seen: OrderedDict) -> tuple[list[dict], dict[str, float]]:
-        sql = SQL_NEW_REQUESTS_FAST if self._use_fast_sql else SQL_NEW_REQUESTS_FALLBACK
+        sqls = (SQL_NEW_REQUESTS_FAST, SQL_NEW_REQUESTS, SQL_NEW_REQUESTS_ALT)
         try:
-            rows = fc.query(sql, timeout=2.2, name="requests")
+            rows = fc.query(sqls[self._req_sql], timeout=3, name="requests")
+            self._pull_fail = 0
         except Exception:
-            self._use_fast_sql = not self._use_fast_sql
+            self._pull_fail += 1
+            if self._pull_fail == 3:   # la query no funciona: se pasa a la siguiente variante
+                self._req_sql = (self._req_sql + 1) % len(sqls)
+                self._pull_fail = 0
+                log(f"lectura de peticiones: cambio a la variante {self._req_sql}")
             raise
-
-        now_local = time.time()
-        if rows:
-            newest_ts = fc.parse_ts(rows[0].get("ts"))
-            if newest_ts is not None:
-                obs_offset = now_local - newest_ts
-                if abs(obs_offset) > 0.5:
-                    self._clock_offset = 0.9 * self._clock_offset + 0.1 * (obs_offset - 0.15)
-
-        now_srv = now_local - self._clock_offset
+        if self._req_sql == 0:         # la ventana corta devuelve vacío: ¿no hay tráfico o falla el filtro?
+            self._empty = 0 if rows else self._empty + 1
+            if self._empty >= 12:
+                self._empty = 0
+                rows = fc.query(SQL_NEW_REQUESTS, timeout=3, name="requests")
+                newest = fc.parse_ts(rows[0].get("ts")) if rows else None
+                if newest is not None and time.time() - newest < 5:
+                    self._req_sql = 1
+                    log("lectura de peticiones: la ventana corta no devuelve datos; uso la lectura completa")
+        now = time.time()
         fresh, ts_map = [], {}
-        for r in rows:
+        for r in reversed(rows):          # de la más antigua a la más nueva
             rid = str(r.get("request_id"))
             if rid in seen:
                 continue
@@ -485,40 +667,24 @@ class Engine:
                 seen.popitem(last=False)
             ts = fc.parse_ts(r.get("ts"))
             if ts is not None:
-                if now_srv - ts > MAX_AGE:
-                    self.stats["descartadas_viejas"] += 1
+                if now - ts > MAX_AGE:
+                    self.stats["descartadas-viejas"] += 1
                     continue
                 ts_map[rid] = ts
             fresh.append(r)
         return fresh, ts_map
 
-    def report(self) -> None:
-        if time.time() - self._last_report < 30:
-            return
-        self._last_report = time.time()
-        ages = np.asarray(self.ages or [0.0])
-        modes = {k: v for k, v in self.stats.items() if k.startswith("v4")}
-        line = (f"resp {self.stats['respondidas']} · latencia p50={np.percentile(ages, 50):.2f}s "
-                f"p95={np.percentile(ages, 95):.2f}s · rank_ms={np.mean(self.compute_ms or [0]):.1f}ms · "
-                f"modos={modes} · oos={len(self.unavailable)}")
-        w = self.fb_window
-        if w["n"]:
-            fb = {k: v for k, v in w.items() if k.startswith("fallback")}
-            line += f" · ON-TIME={100 * w['team'] / w['n']:.1f}% {fb or ''}"
-        log(line)
-        if self.fb_modes:
-            log("   vivo: " + " | ".join(
-                f"{k}: n={int(n)} ctr={100 * c / max(n, 1):.2f}% conv={100 * b / max(n, 1):.2f}% rev=€{rv / max(n, 1):.3f}"
-                for k, (n, c, b, rv) in sorted(self.fb_modes.items())))
-        self.stats = Counter({k: v for k, v in self.stats.items() if k == "respondidas"})
-        self.ages, self.compute_ms, self.fb_window = [], [], Counter()
-
     def run(self) -> None:
         self.bootstrap()
         seen: OrderedDict[str, int] = OrderedDict()
-        log(f"Motor v4-apex activo · equipo {fc.TEAM} · poll={POLL}s · rev_alpha={REVENUE_ALPHA}")
+        log(f"bucle en marcha · equipo {fc.TEAM} · brazo {ARM} · exploración {EXPLORE_RATE} · holdout {HOLDOUT} · "
+            f"final desde {fc.fmt_ts(FINAL_START)} UTC" + (" · DRY-RUN" if self.dry_run else ""))
         while True:
             t0 = time.time()
+            if t0 - self._last_loop > 5:
+                log(f"¡¡ EL BUCLE HA ESTADO PARADO {t0 - self._last_loop:.0f} s !! (equipo suspendido, red caída o "
+                    f"proceso congelado): esas peticiones se han perdido")
+            self._last_loop = t0
             try:
                 fresh, ts_map = self.pull(seen)
                 if fresh:
@@ -526,16 +692,30 @@ class Engine:
                     if answers:
                         self.push(answers, ts_map)
                 self.report()
-            except Exception as e:  # noqa: BLE001
-                log(f"error en bucle principal: {str(e)[:160]}")
-                time.sleep(0.1)
-            elapsed = time.time() - t0
-            if elapsed < POLL:
-                time.sleep(POLL - elapsed)
+            except Exception as e:  # noqa: BLE001  seguir vivos: los compradores llegan mientras dormimos
+                log(f"error en el bucle: {str(e)[:200]}")
+                time.sleep(0.3)
+            time.sleep(max(0.05, POLL - (time.time() - t0)))
+
+
+def keep_awake() -> None:
+    """Windows: impide que el equipo entre en suspensión mientras el recomendador corre."""
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000040)
+        log("suspensión automática de Windows desactivada mientras este proceso esté en marcha")
+    except Exception:  # noqa: BLE001  (no es Windows)
+        pass
 
 
 if __name__ == "__main__":
+    engine = Engine(dry_run="--dry-run" in sys.argv)
+    keep_awake()
     try:
-        Engine(dry_run="--dry-run" in sys.argv).run()
+        engine.run()
     except KeyboardInterrupt:
         log("parado por el usuario")
+    finally:
+        if engine.trainer is not None and engine.trainer.poll() is None:
+            engine.trainer.terminate()
