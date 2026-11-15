@@ -57,12 +57,12 @@ from features_cache import F, FeatureCache, log
 
 HERE = Path(__file__).resolve().parent
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", HERE / "models" / "ranker.pkl"))
-STATE_PATH = Path(os.environ.get("STATE_PATH", HERE / "state" / "live_stats_v7.json"))
+STATE_PATH = Path(os.environ.get("STATE_PATH", HERE / "state" / "live_stats_v9.json"))   # se conserva para no perder el A/B
 POLL = float(os.environ.get("POLL_SECONDS", 0.15))
 MAX_AGE = 6.0            # peticiones más viejas que esto ya han recibido el fallback: no se contestan
 EXPLORE_RATE = float(os.environ.get("EXPLORE_RATE", 0.0))
 HOLDOUT = float(os.environ.get("HOLDOUT", 0.0))
-PUBLIC_NAME = os.environ.get("PUBLIC_NAME", "v7")   # prefijo del model_version que aparece en el marcador
+PUBLIC_NAME = os.environ.get("PUBLIC_NAME", "v9")   # prefijo del model_version que aparece en el marcador
 LABELS_PATH = STATE_PATH.with_name("labels.json")
 # Brazos: cand = ~80 candidatos · wide = ~250 candidatos (aprovecha el margen de tiempo) · full = todo el catálogo.
 # ab (por defecto) reparte 50/50 entre cand y wide; en la final se queda solo el que más compras reales consiga.
@@ -121,12 +121,14 @@ class Ranker:
             raise RuntimeError("el modelo se entrenó con otra lista de features: vuelve a entrenar")
         self.combine = str(bundle.get("combine", "click"))
         self.click = lgb.Booster(model_str=bundle["click"])
-        self.buy = lgb.Booster(model_str=bundle["buy"]) if bundle.get("buy") and self.combine in ("click_x_buy", "blend") else None
-        self.direct = lgb.Booster(model_str=bundle["direct"]) if bundle.get("direct") and self.combine in ("direct", "blend") else None
+        self.buy = lgb.Booster(model_str=bundle["buy"]) if bundle.get("buy") and self.combine in ("click_x_buy", "blend", "blend_add") else None
+        self.direct = lgb.Booster(model_str=bundle["direct"]) if bundle.get("direct") and self.combine in ("direct", "blend", "blend_add") else None
+        self.rank = lgb.Booster(model_str=bundle["rank"]) if bundle.get("rank") and self.combine == "rank" else None
         self.vocab = bundle.get("vocab", {})
         self.version = str(bundle.get("version", "lgb"))
         self.wide_default = bool(bundle.get("wide_pool", False))   # lo que dijo la validación offline
         self.cache_blocks = set(bundle.get("cache_blocks", [])) - {"vistas diarias"}
+        self.cart_boost = bool(bundle.get("cart_boost", False))   # solo si el entrenamiento lo validó
 
     @classmethod
     def load(cls, path: Path | str = MODEL_PATH) -> "Ranker":
@@ -136,6 +138,8 @@ class Ranker:
     def score(self, X: np.ndarray) -> np.ndarray:
         """P(compra) según la combinación que ganó en validación (train_model.py la elige)."""
         th = PRED_THREADS if len(X) > 2000 else 1
+        if self.rank is not None:      # modelo de ranking (lambdarank): la puntuación solo sirve para ordenar
+            return np.nan_to_num(np.asarray(self.rank.predict(X, num_threads=th), np.float64), nan=-1e9)
         if self.combine == "direct" and self.direct is not None:
             p = self.direct.predict(X, num_threads=th)
         else:
@@ -144,7 +148,46 @@ class Ranker:
                 p = p * self.buy.predict(X, num_threads=th)
             if self.combine == "blend" and self.direct is not None:
                 p = np.sqrt(np.maximum(p, 1e-12) * np.maximum(self.direct.predict(X, num_threads=th), 1e-12))
+            elif self.combine == "blend_add" and self.direct is not None:
+                p = 0.6 * p + 0.4 * self.direct.predict(X, num_threads=th)
         return np.nan_to_num(np.asarray(p, np.float64), nan=0.0)
+
+
+def apply_cart_boost(s: np.ndarray, X: np.ndarray, max_items: int = 2) -> np.ndarray:
+    """Hasta 2 productos que el usuario tiene en el carrito (y no ha comprado) pasan a los primeros puestos,
+    el más reciente primero. Solo se aplica si train_model.py comprobó en el feedback que ordena mejor la compra."""
+    cart = np.flatnonzero(X[:, F["lc_in"]] > 0)
+    if not cart.size:
+        return s
+    rec = X[cart, F["lc_recency"]]
+    pick = cart[np.argsort(-rec, kind="stable")[:max_items]]
+    s = s.copy()
+    s[pick] = float(s.max()) + 1.0 + X[pick, F["lc_recency"]]
+    return s
+
+
+def diversify(cands: np.ndarray, s: np.ndarray, subs: np.ndarray, k: int = 10, pool: int = 40,
+              penalty: float = 0.75) -> list[int]:
+    """Selección voraz: cada producto ya elegido de la misma subcategoría multiplica por `penalty` la
+    puntuación (normalizada a 0-1) de los siguientes. Evita listas de 10 variantes casi iguales."""
+    pool = min(pool, len(s))
+    part = np.argpartition(-s, pool - 1)[:pool] if pool < len(s) else np.arange(len(s))
+    part = part[np.argsort(-s[part], kind="stable")]
+    sp = s[part]
+    lo, hi = float(sp.min()), float(sp.max())
+    base = (sp - lo) / (hi - lo + 1e-12) + 1e-6
+    sub = subs[cands[part]]
+    seen: dict[int, int] = {}
+    chosen: list[int] = []
+    free = np.ones(len(part), bool)
+    for _ in range(min(k, len(part))):
+        mult = np.fromiter((penalty ** seen.get(int(x), 0) for x in sub), np.float64, len(sub))
+        val = np.where(free, base * mult, -1.0)
+        j = int(np.argmax(val))
+        free[j] = False
+        chosen.append(int(cands[part[j]]))
+        seen[int(sub[j])] = seen.get(int(sub[j]), 0) + 1
+    return chosen
 
 
 def rank_batch(cache: FeatureCache, ranker: Ranker | None, recs: list[dict], arms: list[str] | None = None,
@@ -172,7 +215,7 @@ def rank_batch(cache: FeatureCache, ranker: Ranker | None, recs: list[dict], arm
                     full_pool = cache.all_candidates()
                 cands = full_pool
             else:
-                cands = cache.candidates(R, S, wide=arm == "wide")
+                cands = cache.candidates(R, S, wide=arm in ("wide", "div"))
             prepared.append((R, cands, cache.featurize(R, S, cands, ranker.vocab)))
         except Exception as e:  # noqa: BLE001  una petición rara no tumba el lote
             log(f"petición {rec.get('request_id')} no procesable: {str(e)[:150]}")
@@ -189,8 +232,12 @@ def rank_batch(cache: FeatureCache, ranker: Ranker | None, recs: list[dict], arm
         R, cands, X = p
         s = np.array(scores[off: off + len(cands)], np.float64)
         off += len(cands)
-        if REBUY_PENALTY != 1.0:
-            s[X[:, F["user_bought"]] > 0] *= REBUY_PENALTY
+        if REBUY_PENALTY < 1.0:        # lo ya comprado va al fondo, sea cual sea la escala de la puntuación
+            bought = X[:, F["user_bought"]] > 0
+            if bought.any():
+                s[bought] -= float(s.max() - s.min()) + 1.0
+        if ranker.cart_boost:
+            s = apply_cart_boost(s, X)
         k = min(len(s), WIDE_POOL if exp == "wide" else 10)
         part = np.argpartition(-s, k - 1)[:k] if k < len(s) else np.arange(len(s))
         order = part[np.argsort(-s[part], kind="stable")]
@@ -211,6 +258,8 @@ def rank_batch(cache: FeatureCache, ranker: Ranker | None, recs: list[dict], arm
                     break
             rng.shuffle(top)
             label += "+wide"
+        elif arm == "div":
+            top = diversify(cands, s, cache.sub)
         else:
             top = cands[order[:10]].tolist()
         out.append(([pids[i] for i in top], label, R))
@@ -251,6 +300,7 @@ class Engine:
         self._last_loop = time.time()
         self.pushers = ThreadPoolExecutor(max_workers=3, thread_name_prefix="push")
         self.slow_until = 0.0
+        self._ctr_logged = 0.0
         try:
             self.fb_modes = {k: list(v) for k, v in json.loads(STATE_PATH.read_text()).items()}
             log(f"estadísticas en vivo recuperadas de {STATE_PATH.name} ({len(self.fb_modes)} etiquetas)")
@@ -293,7 +343,8 @@ class Engine:
         ranker = Ranker.load(MODEL_PATH)
         ranker.score(np.zeros((2, fc.NF), np.float32))  # prueba de humo antes de publicarlo
         self.ranker = ranker
-        log(f"modelo cargado: {ranker.version} (puntuación: {ranker.combine}; "
+        log(f"modelo cargado: {ranker.version} · prioridad al carrito: {'sí' if ranker.cart_boost else 'no'}")
+        log(f"   detalle: {ranker.version} (puntuación: {ranker.combine if ranker.combine != 'rank' or ranker.rank is not None else 'click'}; "
             f"validación offline prefiere {'wide' if ranker.wide_default else 'cand'})")
 
     def consistency_warning(self) -> str:
@@ -338,7 +389,8 @@ class Engine:
                 for name, fn in (("catálogo", cache.refresh_catalog), ("tendencias", cache.refresh_trending),
                                  ("co-views en directo", cache.refresh_live_coviews),
                                  ("perfil de usuario en directo", cache.refresh_user_events),
-                                 ("compras hechas con nuestras recomendaciones", cache.load_own_purchases)):
+                                 ("compras hechas con nuestras recomendaciones", cache.load_own_purchases),
+                                 ("feedback de las últimas 12 h (CTR de productos nuevos)", cache.bootstrap_feedback)):
                     try:
                         fn()
                     except Exception as e:  # noqa: BLE001
@@ -401,6 +453,11 @@ class Engine:
                 self.fb_seen.popitem(last=False)
             served = str(r.get("served_by") or "")
             clicked, purchased = fc.as_pid(r.get("clicked")), fc.as_pid(r.get("purchased"))
+            if cache is not None:
+                try:
+                    cache.observe_feedback(fc.as_list(r.get("shown")), clicked, purchased)
+                except Exception:  # noqa: BLE001
+                    pass
             meta = self.req_meta.get(rid)
             if meta is None:
                 fts = fc.parse_ts(r.get("ts"))
@@ -433,6 +490,11 @@ class Engine:
                     st[2] += bool(purchased)
             if purchased and cache is not None:
                 cache.add_purchase(user, purchased)
+        if cache is not None:
+            n_upd = cache.refresh_new_item_ctr()
+            if n_upd and time.time() - self._ctr_logged > 900:
+                self._ctr_logged = time.time()
+                log(f"CTR en vivo aplicado a {n_upd} productos nuevos")
 
     def bootstrap(self) -> None:
         while not self.best:
@@ -466,7 +528,7 @@ class Engine:
     # --- brazos del A/B ------------------------------------------------------------------------
     def arm_stats(self) -> dict[str, list[int]]:
         """Compras reales acumuladas de cada brazo, solo con respuestas de explotación (sin '+')."""
-        agg = {"wide": [0, 0, 0], "cand": [0, 0, 0], "full": [0, 0, 0]}
+        agg = {"wide": [0, 0, 0], "cand": [0, 0, 0], "div": [0, 0, 0], "full": [0, 0, 0]}
         for label, st in self.fb_modes.items():
             if "+" not in label:
                 arm = label.rsplit("-", 1)[-1]
@@ -475,20 +537,20 @@ class Engine:
         return agg
 
     def choose_final_arm(self) -> str:
-        if ARM in ("full", "cand", "wide"):
+        if ARM in ("full", "cand", "wide", "div"):
             return ARM
         if time.time() < self.slow_until:
             log("FINAL · el equipo va justo de latencia: brazo cand (retrieval rápido)")
             return "cand"
         agg = self.arm_stats()
-        (nw, _, bw), (nc, _, bc) = agg["wide"], agg["cand"]
-        if nw >= 3000 and nc >= 3000:
-            arm = "wide" if bw / nw > bc / nc else "cand"
-            log(f"FINAL · brazo elegido por conversión en vivo: {arm} "
-                f"(wide {100 * bw / nw:.2f}% con n={nw}; cand {100 * bc / nc:.2f}% con n={nc})")
+        ok = {a: v for a, v in agg.items() if a != "full" and v[0] >= 3000}
+        if len(ok) >= 2:
+            arm = max(ok, key=lambda a: ok[a][2] / ok[a][0])
+            log("FINAL · brazo elegido por conversión en vivo: " + arm + " (" + ", ".join(
+                f"{a} {100 * v[2] / v[0]:.2f}% n={v[0]}" for a, v in ok.items()) + ")")
         else:
             arm = "wide" if (self.ranker is not None and self.ranker.wide_default) else "cand"
-            log(f"FINAL · pocos datos del A/B en vivo (wide n={nw}, cand n={nc}): brazo según validación offline: {arm}")
+            log(f"FINAL · pocos datos del A/B en vivo: brazo según validación offline: {arm}")
         return arm
 
     def public_label(self, internal: str) -> str:
@@ -498,7 +560,8 @@ class Engine:
         nombre (mucho menos ruidosa que nuestras compras reales): es la mejor vara de medir el A/B."""
         if internal.startswith("holdout"):
             return PUBLIC_NAME + "h"
-        base = "a" if "-full" in internal else "b" if "-cand" in internal else "w" if "-wide" in internal else "0"
+        base = ("a" if "-full" in internal else "b" if "-cand" in internal else "w" if "-wide" in internal
+                else "d" if "-div" in internal else "0")
         return PUBLIC_NAME + base + ("x" if "+" in internal else "")
 
     def finalize(self, items: list[str] | None) -> list[str] | None:
@@ -546,7 +609,7 @@ class Engine:
                     arms.append(self.final_arm)
                     explore.append(None)
                 else:
-                    arms.append(ARM if ARM in ("full", "cand", "wide") else ("wide" if (h >> 8) & 1 else "cand"))
+                    arms.append(ARM if ARM in ("full", "cand", "wide", "div") else ("cand", "wide", "div")[(h >> 8) % 3])
                     u = self.rng.random()
                     explore.append("shuf" if u < EXPLORE_RATE / 2 else "wide" if u < EXPLORE_RATE else None)
         if len(todo) > MAX_FULL_BATCH or t0 < self.slow_until:   # atasco o equipo lento: la latencia manda
@@ -625,16 +688,16 @@ class Engine:
                 line += (f" · latencia según el organizador p50 {np.percentile(lat, 50):.0f} ms "
                          f"p95 {np.percentile(lat, 95):.0f} ms")
         log(line)
-        # guardia de latencia: si el cómputo o la latencia medida suben, el catálogo completo se apaga 15 min
+        # Guardia de latencia: el brazo amplio solo se apaga si el CÓMPUTO es el problema. Un p95 alto con
+        # cómputo bajo es la red: apagar el brazo no arreglaría nada y dejaría el A/B sin datos.
         comp50 = float(np.percentile(self.compute_ms or [0], 50))
         lat95 = float(np.percentile(self.srv_latency, 95)) if len(self.srv_latency) >= 20 else 0.0
-        if ARM != "cand" and (comp50 > SLOW_COMPUTE_MS or lat95 > SLOW_P95_MS):
+        if ARM != "cand" and comp50 > SLOW_COMPUTE_MS:
             if time.time() >= self.slow_until:
-                log(f"   LATENCIA ALTA (cómputo p50 {comp50:.0f} ms, p95 organizador {lat95:.0f} ms): "
-                    f"paso todo a retrieval rápido durante 15 min")
+                log(f"   CÓMPUTO ALTO (p50 {comp50:.0f} ms): paso todo a retrieval rápido durante 15 min")
             self.slow_until = time.time() + 900
         elif lat95 > SLOW_P95_MS:
-            log(f"   LATENCIA ALTA (p95 organizador {lat95:.0f} ms) ya en modo rápido: es la red o el equipo, no el modelo")
+            log(f"   aviso: p95 del organizador {lat95:.0f} ms con cómputo de {comp50:.0f} ms: es la red, no el modelo")
         if w["no_vistas"]:
             log(f"   ATENCIÓN: {w['no_vistas']} peticiones llegaron y no las contestamos (bucle parado o red caída)")
         if w["ajenas"]:
@@ -650,7 +713,7 @@ class Engine:
             log(warn)
         if self.fb_modes:
             agg = self.arm_stats()
-            groups = {"A/B wide": agg["wide"], "A/B cand": agg["cand"], "full": agg["full"]}
+            groups = {"A/B cand": agg["cand"], "A/B wide": agg["wide"], "A/B div": agg["div"], "full": agg["full"]}
             for key in ("holdout-baseline", "cold", "fallback-organizador"):
                 if key in self.fb_modes:
                     groups[key] = self.fb_modes[key]

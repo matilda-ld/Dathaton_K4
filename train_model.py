@@ -245,6 +245,11 @@ def build_matrix(cache: FeatureCache, recs: list[dict], vocab: dict, source: str
         pos += k
         n_imp += 1
     cache.set_recent_counts(None)
+    if source == "feedback" and pos:
+        # El feedback más reciente refleja mejor la política y las tendencias actuales: semivida de 6 h,
+        # de ~2× el peso base (recién llegado) a ~0,5× (más de un día).
+        age_h = (ts_row[:pos].max() - ts_row[:pos]) / 3600.0
+        w[:pos] *= (0.5 + 1.5 * 0.5 ** (age_h / 6.0)).astype(np.float32)
     return {"X": X[:pos], "yc": yc[:pos], "yb": yb[:pos], "w": w[:pos], "imp": imp[:pos], "ts": ts_row[:pos],
             "recs": kept, "n_imp": n_imp}
 
@@ -268,6 +273,29 @@ def fit(X, y, w, Xv, yv, wv, params: dict, rounds: int = 2000, fixed_rounds: int
                      callbacks=[lgb.early_stopping(60, verbose=False), lgb.log_evaluation(200)])
 
 
+def group_sizes(imp_rows: np.ndarray) -> np.ndarray:
+    """Tamaño de cada impresión (sus filas van seguidas) para el objetivo de ranking."""
+    cuts = np.flatnonzero(np.r_[True, imp_rows[1:] != imp_rows[:-1], True])
+    return np.diff(cuts)
+
+
+def fit_rank(X, y, w, imp_rows, Xv, yv, wv, imp_v, threads: int, fixed_rounds: int | None = None):
+    """LambdaMART: en vez de puntuar cada fila por separado, aprende a ORDENAR los productos de una misma
+    impresión (compra = 2, clic sin compra = 1, ignorado = 0). Solo aportan las impresiones con algún clic."""
+    import lightgbm as lgb
+
+    params = dict(objective="lambdarank", metric="ndcg", eval_at=[10], learning_rate=0.05, num_leaves=31,
+                  min_data_in_leaf=50, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=2.0,
+                  lambdarank_truncation_level=10, cat_smooth=20, num_threads=threads, verbose=-1, seed=0)
+    dtr = lgb.Dataset(X, y, weight=w, group=group_sizes(imp_rows), feature_name=FEATURES,
+                      categorical_feature=CATEGORICAL, free_raw_data=False)
+    if fixed_rounds:
+        return lgb.train(params, dtr, num_boost_round=fixed_rounds)
+    dva = lgb.Dataset(Xv, yv, weight=wv, group=group_sizes(imp_v), reference=dtr)
+    return lgb.train(params, dtr, num_boost_round=1500, valid_sets=[dva],
+                     callbacks=[lgb.early_stopping(60, verbose=False), lgb.log_evaluation(200)])
+
+
 def auc(y, p, w=None) -> float:
     from sklearn.metrics import roc_auc_score
 
@@ -286,6 +314,58 @@ def mrr(score: np.ndarray, label: np.ndarray, imp: np.ndarray) -> tuple[float, i
     first = np.repeat(start, np.diff(np.r_[start, len(score)]))
     rank[order] = np.arange(len(score)) - first + 1
     return float((1.0 / rank[pos_rows]).mean()), int(len(pos_rows))
+
+
+def cart_boost_check(Xv, score, yv_b, imp_v, mask) -> dict:
+    """MRR de la compra con y sin subir el carrito, en las impresiones (de feedback) que tienen carrito."""
+    from recommender_v2 import apply_cart_boost
+
+    rows = np.flatnonzero(mask)
+    has_cart = np.zeros(len(score), bool)
+    has_cart[rows[Xv[rows, F["lc_in"]] > 0]] = True
+    imps = np.unique(imp_v[has_cart])
+    m = np.isin(imp_v, imps) & mask
+    n_buy = int(yv_b[m].sum())
+    if n_buy < 20:
+        return {"activar": False, "motivo": f"pocas compras en impresiones con carrito ({n_buy})"}
+    boosted = score.copy()
+    idx = np.flatnonzero(m)
+    order = np.argsort(imp_v[idx], kind="stable")
+    idx = idx[order]
+    cuts = np.flatnonzero(np.r_[True, imp_v[idx][1:] != imp_v[idx][:-1], True])
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        g = idx[a:b]
+        boosted[g] = apply_cart_boost(score[g], Xv[g])
+    base_mrr = mrr(score[m], yv_b[m], imp_v[m])[0]
+    new_mrr = mrr(boosted[m], yv_b[m], imp_v[m])[0]
+    return {"activar": bool(new_mrr > base_mrr), "mrr_sin": round(base_mrr, 4), "mrr_con": round(new_mrr, 4),
+            "compras": n_buy, "impresiones": int(len(imps))}
+
+
+def champion_check(Xv, new_score, yv_b, imp_v, fb_mask, ts_v) -> dict:
+    """Compara el aspirante con el modelo de models/ranker.pkl en las impresiones de feedback posteriores a
+    cuando se entrenó ese modelo (ninguno de los dos las ha visto: el aspirante deja fuera la validación)."""
+    path = MODEL_DIR / "ranker.pkl"
+    if not path.exists():
+        return {"desplegar": True, "motivo": "no hay modelo en producción"}
+    try:
+        from recommender_v2 import Ranker
+
+        with open(path, "rb") as f:
+            old_bundle = pickle.load(f)
+        old = Ranker(old_bundle)
+        since = float(old_bundle.get("trained_at", 0.0))
+    except Exception as e:  # noqa: BLE001
+        return {"desplegar": True, "motivo": f"el modelo actual no se puede usar ({str(e)[:80]})"}
+    win = fb_mask & (ts_v > since)
+    n_buy = int(yv_b[win].sum())
+    if n_buy < 40:
+        return {"desplegar": True, "motivo": f"pocas compras nuevas para comparar ({n_buy})", "actual": old_bundle.get("version")}
+    old_score = old.score(Xv[win])
+    m_new = mrr(new_score[win], yv_b[win], imp_v[win])[0]
+    m_old = mrr(old_score, yv_b[win], imp_v[win])[0]
+    return {"desplegar": bool(m_new >= m_old), "mrr_compra_nuevo": round(m_new, 4), "mrr_compra_actual": round(m_old, 4),
+            "compras_comparadas": n_buy, "actual": old_bundle.get("version")}
 
 
 def policy_eval(cache: FeatureCache, bundle: dict, recs: list[dict], n: int) -> dict:
@@ -400,11 +480,10 @@ def run_once(args) -> None:
     # 2) perfil de usuario con hora (carritos y compras): histórico desde 2 días antes del corte + stream
     cache.user_ev, cache._ev_ts = {}, 0.0
     since = str((pd.Timestamp(cut) - pd.Timedelta(days=2)).date())
-    for table, arg in (("shop.history_events", since), ("shop.events", None)):
-        try:
-            log(f"eventos de usuario de {table}: {cache.load_user_events(table, arg)}")
-        except Exception as e:  # noqa: BLE001
-            log(f"sin eventos de usuario de {table}: {str(e)[:200]}")
+    try:
+        log(f"eventos de usuario de shop.history_events: {cache.load_user_events('shop.history_events', since)}")
+    except Exception as e:  # noqa: BLE001
+        log(f"sin eventos de usuario de shop.history_events: {str(e)[:200]}")
 
     # 3) datos etiquetados (el histórico se procesa trozo a trozo)
     fb: list[dict] = []
@@ -436,6 +515,15 @@ def run_once(args) -> None:
             log(f"productos nuevos incorporados para el feedback: {cache.refresh_catalog()}")
         except Exception as e:  # noqa: BLE001
             log(f"no se pudo leer catalog_updates: {str(e)[:160]}")
+        # Ahora que existen los productos nuevos: eventos en vivo (carritos y compras orgánicas) y las compras
+        # hechas con nuestras recomendaciones, con su hora. Antes se cargaban demasiado pronto y se perdían
+        # las de productos nuevos; las compras propias no se cargaban.
+        for label, fn in (("eventos de usuario de shop.events", lambda: cache.load_user_events("shop.events")),
+                          ("compras con nuestras recomendaciones", cache.add_own_purchases_ts)):
+            try:
+                log(f"{label}: {fn()}")
+            except Exception as e:  # noqa: BLE001
+                log(f"sin {label}: {str(e)[:200]}")
         part = build_matrix(cache, fb, vocab, "feedback", hourly=hourly, seed=99)
         part.pop("recs")
         parts.append(part)
@@ -454,6 +542,7 @@ def run_once(args) -> None:
     imp = np.concatenate([p["imp"] + o for p, o in zip(parts, offs)])
     va = np.concatenate([time_split(p) for p in parts])
     is_fb = np.concatenate([np.full(len(p["yc"]), src == "feedback") for p, src in zip(parts, sources)])
+    ts_all = np.concatenate([p["ts"] for p in parts])
     tr = ~va
     n_fb_used = int(parts[-1]["n_imp"]) if fb else 0
     del parts
@@ -468,12 +557,21 @@ def run_once(args) -> None:
     p_buy = dict(objective="binary", learning_rate=0.03, num_leaves=15, min_data_in_leaf=40,
                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0,
                  cat_smooth=20, num_threads=threads, verbose=-1, seed=0)
+    # Lo que puntúa es el simulador y nuestro feedback es su único reflejo: si hay datos suficientes, el early
+    # stopping y la elección de modelo se deciden SOLO con la validación de feedback.
+    fb_val = va & is_fb
+    use_fb = int(yb[fb_val].sum()) >= 50 and int(yc[fb_val].sum()) >= 150
+    es = fb_val if use_fb else va
+    log(f"validación para decidir: {'solo feedback' if use_fb else 'histórico + feedback'} "
+        f"({int(es.sum())} filas, {int(yb[es].sum())} compras)")
     log("entrenando P(clic)…")
-    m_click = fit(X[tr], yc[tr], w[tr], X[va], yc[va], w[va], p_click)
+    m_click = fit(X[tr], yc[tr], w[tr], X[es], yc[es], w[es], p_click)
     it_click = m_click.best_iteration or m_click.current_iteration()
 
     m_buy, it_buy = None, 0
-    ctr, cva = tr & (yc == 1), va & (yc == 1)
+    ctr, cva = tr & (yc == 1), es & (yc == 1)
+    if int(yb[cva].sum()) < 30:
+        cva = va & (yc == 1)
     if int(yb[ctr].sum()) >= 150 and int((1 - yb[ctr]).sum()) >= 150 and int(yb[cva].sum()) >= 30:
         log("entrenando P(compra | clic)…")
         m_buy = fit(X[ctr], yb[ctr], w[ctr], X[cva], yb[cva], w[cva], p_buy)
@@ -481,10 +579,24 @@ def run_once(args) -> None:
     else:
         log("pocos clics/compras para P(compra | clic): se usará solo P(clic)")
     m_dir, it_dir = None, 0
-    if int(yb[tr].sum()) >= 300 and int(yb[va].sum()) >= 50:
+    if int(yb[tr].sum()) >= 300 and int(yb[es].sum()) >= 50:
         log("entrenando P(compra) directa…")
-        m_dir = fit(X[tr], yb[tr], w[tr], X[va], yb[va], w[va], dict(p_buy, num_leaves=31, min_data_in_leaf=80))
+        m_dir = fit(X[tr], yb[tr], w[tr], X[es], yb[es], w[es], dict(p_buy, num_leaves=31, min_data_in_leaf=80))
         it_dir = m_dir.best_iteration or m_dir.current_iteration()
+
+    # modelo de ranking (lambdarank) como candidato adicional: solo se usará si ordena mejor la compra
+    m_rank, it_rank = None, 0
+    grade = (yc.astype(np.int32) + yb.astype(np.int32))
+    has_pos = np.isin(imp, np.unique(imp[yc == 1]))
+    rtr, rva = tr & has_pos, es & has_pos
+    try:
+        if int(yb[rtr].sum()) >= 300 and int(yb[rva].sum()) >= 50:
+            log("entrenando el modelo de ranking (lambdarank)…")
+            m_rank = fit_rank(X[rtr], grade[rtr], w[rtr], imp[rtr], X[rva], grade[rva], w[rva], imp[rva], threads)
+            it_rank = m_rank.best_iteration or m_rank.current_iteration()
+    except Exception as e:  # noqa: BLE001
+        log(f"modelo de ranking omitido: {str(e)[:200]}")
+        m_rank = None
 
     # 4) validación (slot neutralizado, como en producción)
     Xv = X[va].copy()
@@ -511,10 +623,16 @@ def run_once(args) -> None:
         options["direct"] = pd_
         if pb is not None:
             options["blend"] = np.sqrt(np.maximum(pc * pb, 1e-12) * np.maximum(pd_, 1e-12))
+            options["blend_add"] = 0.6 * pc * pb + 0.4 * pd_
+    if m_rank is not None:
+        options["rank"] = m_rank.predict(Xv, num_iteration=it_rank)
     for name, sc in options.items():
         metrics["mrr_compra"][name] = mrr(sc, yv_b, imp_v)[0]
         metrics.setdefault("auc_compra", {})[name] = auc(yv_b, sc, wv)
-    combine = max(options, key=lambda k: (metrics["mrr_compra"][k], metrics["auc_compra"][k]))
+    sel = is_fb[va] if use_fb else np.ones(int(va.sum()), bool)
+    sel_mrr = {k: mrr(v[sel], yv_b[sel], imp_v[sel])[0] for k, v in options.items()}
+    metrics["mrr_compra_para_elegir"] = {"sobre": "feedback" if use_fb else "todo", **sel_mrr}
+    combine = max(options, key=lambda k: (sel_mrr[k], metrics["auc_compra"][k]))
     metrics["combinacion_elegida"] = combine
     fbv = is_fb[va]
     if fbv.any():   # la parte que más importa: validación SOLO con el simulador real (nuestro feedback)
@@ -523,6 +641,7 @@ def run_once(args) -> None:
             "impresiones_usadas": n_fb_used, "compras_validacion": int(yv_b[fbv].sum()),
             "auc_clic": auc(yv_c[fbv], pc[fbv], wv[fbv]), "auc_compra": auc(yv_b[fbv], final[fbv], wv[fbv]),
             "mrr_compra_modelo": mrr(final[fbv], yv_b[fbv], imp_v[fbv])[0],
+            "mrr_compra_por_opcion": {k: mrr(v[fbv], yv_b[fbv], imp_v[fbv])[0] for k, v in options.items()},
             "mrr_compra_orden_mostrado": mrr(slot_score[fbv], yv_b[fbv], imp_v[fbv])[0]}
     gain = m_click.feature_importance("gain")
     metrics["importancia_gain_top"] = {FEATURES[i]: round(float(gain[i] / max(gain.sum(), 1e-9)), 4)
@@ -532,6 +651,7 @@ def run_once(args) -> None:
     bundle = {"click": m_click.model_to_string(num_iteration=it_click),
               "buy": m_buy.model_to_string(num_iteration=it_buy) if m_buy is not None else None,
               "direct": m_dir.model_to_string(num_iteration=it_dir) if m_dir is not None else None,
+              "rank": m_rank.model_to_string(num_iteration=it_rank) if m_rank is not None else None,
               "cache_blocks": sorted(k for k, v in cache.status.items() if v == "OK"),
               "combine": combine, "features": list(FEATURES), "vocab": vocab, "cat_names": cache.cat_names,
               "version": version, "cut": cut, "trained_at": time.time(), "wide_pool": False}
@@ -545,7 +665,30 @@ def run_once(args) -> None:
             log(f"evaluación del pipeline omitida: {str(e)[:200]}")
     log("validación:\n" + json.dumps(metrics, indent=2, ensure_ascii=False))
 
-    # 5) reentreno con todos los datos y guardado atómico (el recomendador lo recarga en caliente)
+    # 4b) ¿subir al principio lo que el usuario tiene en el carrito ordena mejor la compra? Se mide en el
+    #     feedback de validación, solo en las impresiones con algún producto del carrito entre los mostrados.
+    bundle["cart_boost"] = False
+    try:
+        cb = cart_boost_check(Xv, options[combine], yv_b, imp_v, sel)
+        metrics["prioridad_carrito"] = cb
+        bundle["cart_boost"] = bool(cb.get("activar"))
+        log(f"prioridad al carrito: {cb}")
+    except Exception as e:  # noqa: BLE001
+        log(f"prueba de prioridad al carrito omitida: {str(e)[:200]}")
+
+    # 5) ¿el modelo nuevo es mejor que el que está en producción? Se comparan los dos sobre feedback que
+    #    NINGUNO ha visto al entrenar (posterior a cuando se entrenó el actual). Si no gana, no se despliega.
+    verdict = champion_check(Xv, options[combine], yv_b, imp_v, is_fb[va] & (ts_all[va] > 0), ts_all[va])
+    metrics["campeon"] = verdict
+    log(f"comparación con el modelo en producción: {verdict}")
+    if not verdict["desplegar"]:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        (MODEL_DIR / f"metrics_{version}_rechazado.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
+        log(f"modelo {version} NO desplegado: el actual ordena mejor la compra. Se mantiene. "
+            f"Total {time.time() - t_start:.0f}s")
+        return
+
+    # 6) reentreno con todos los datos y guardado atómico (el recomendador lo recarga en caliente)
     log("reentrenando con todos los datos…")
     f_click = fit(X, yc, w, None, None, None, p_click, fixed_rounds=int(it_click * 1.1) + 1)
     bundle["click"] = f_click.model_to_string()
@@ -557,6 +700,10 @@ def run_once(args) -> None:
         f_dir = fit(X, yb, w, None, None, None, dict(p_buy, num_leaves=31, min_data_in_leaf=80),
                     fixed_rounds=int(it_dir * 1.1) + 1)
         bundle["direct"] = f_dir.model_to_string()
+    if m_rank is not None and combine == "rank":
+        f_rank = fit_rank(X[has_pos], grade[has_pos], w[has_pos], imp[has_pos], None, None, None, None, threads,
+                          fixed_rounds=int(it_rank * 1.1) + 1)
+        bundle["rank"] = f_rank.model_to_string()
     bundle["metrics"] = metrics
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     tmp = MODEL_DIR / "ranker.tmp"

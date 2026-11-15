@@ -378,7 +378,7 @@ SQL_UPDATES_SINCE = "SELECT * FROM shop.catalog_updates WHERE ts > '{since}'"
 SQL_TRENDING = """
 SELECT product_id::String AS product_id,
        countIf(event_type = 'view') AS v6,
-       countIf(event_type = 'view' AND ts > now() - INTERVAL 2 HOUR) AS v2,
+       countIf(event_type = 'view' AND ts > now() - INTERVAL 1 HOUR) AS v2,
        countIf(event_type = 'view' AND ts > now() - INTERVAL 20 MINUTE) AS v20,
        countIf(event_type = 'purchase' AND ts > now() - INTERVAL 2 HOUR) AS b2
 FROM shop.events
@@ -387,7 +387,7 @@ GROUP BY product_id"""
 SQL_TRENDING_SIMPLE = """
 SELECT product_id::String AS product_id, count() AS v2
 FROM shop.events
-WHERE event_type = 'view' AND ts > now() - INTERVAL 2 HOUR
+WHERE event_type = 'view' AND ts > now() - INTERVAL 1 HOUR
 GROUP BY product_id"""
 
 SQL_LIVE_COVIEWS = """
@@ -410,6 +410,17 @@ SELECT r.user_id::String AS user_id, f.purchased::String AS product_id
 FROM {TEAM}.feedback AS f
 INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String
 WHERE f.purchased != '' AND f.request_id != '__init__'"""
+
+SQL_OWN_PURCHASES_TS = f"""
+SELECT r.user_id::String AS user_id, f.purchased::String AS product_id, f.ts AS ts
+FROM {TEAM}.feedback AS f
+INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String
+WHERE f.purchased != '' AND f.request_id != '__init__'"""
+
+SQL_FEEDBACK_BOOT = f"""
+SELECT shown, clicked, purchased
+FROM {TEAM}.feedback
+WHERE request_id != '__init__' AND ts > now() - INTERVAL 12 HOUR AND ts < now() - INTERVAL 3 MINUTE"""
 
 SQL_LIVE_PURCHASES_ALL = """
 SELECT user_id::String AS user_id, product_id::String AS product_id
@@ -464,6 +475,23 @@ class FeatureCache:
     def __setstate__(self, d: dict) -> None:
         self.__dict__.update(d)
         self._lock = threading.Lock()
+        self._init_live_fb()
+
+    def _init_live_fb(self) -> None:
+        """Contadores del feedback en vivo (por producto y por slot) para corregir el CTR de los productos
+        nuevos con lo que pasa de verdad en el carrusel. Se crean vacíos si la caché es de una versión anterior."""
+        cap = getattr(self, "cap", 0)
+        if not cap:
+            return
+        if getattr(self, "prior_ctr", None) is None or len(self.prior_ctr) != cap:
+            self.prior_ctr = np.full(cap, np.nan, np.float32)
+            self.prior_cvr = np.full(cap, np.nan, np.float32)
+        self.fb_slot_imps = np.zeros((cap, 10), np.float32)
+        self.fb_clicks = np.zeros(cap, np.float32)
+        self.fb_buys = np.zeros(cap, np.float32)
+        self.g_slot_imps = np.zeros(10, np.float64)
+        self.g_slot_clicks = np.zeros(10, np.float64)
+        self.g_slot_buys = np.zeros(10, np.float64)
 
     def save(self, path: Path | str = LIVE_CACHE_PATH) -> None:
         path = Path(path)
@@ -618,6 +646,7 @@ class FeatureCache:
             if m.any():
                 self.sub_price[code] = self.price[:n][m].mean()
         self._refresh_avail()
+        self._init_live_fb()
 
     def _code(self, table: dict[str, int], value: Any, limit: int) -> int:
         key = str(value)
@@ -1066,6 +1095,9 @@ class FeatureCache:
         if nb.size:
             w = w / w.sum()
             self.item_feat[idx, stat_cols] = w @ self.item_feat[nb][:, stat_cols]
+            if getattr(self, "prior_ctr", None) is not None:
+                self.prior_ctr[idx] = self.item_feat[idx, F["car_ctr"]]
+                self.prior_cvr[idx] = self.item_feat[idx, F["car_cvr"]]
             self.views_long[idx] = float(w @ self.views_long[nb])
             merged: dict[int, float] = {}
             for j, wj in zip(nb.tolist(), w.tolist()):
@@ -1195,6 +1227,68 @@ class FeatureCache:
         for r in rows:
             self.add_purchase(str(r.get("user_id") or ""), str(r.get("product_id") or ""))
         return len(rows)
+
+    def observe_feedback(self, shown: list, clicked: str, purchased: str) -> None:
+        """Una impresión real del carrusel (nuestra o del fallback): cuenta impresiones por slot y clics/compras."""
+        if getattr(self, "fb_slot_imps", None) is None:
+            return
+        get = self.pid2idx.get
+        for s, p in enumerate(shown[:10]):
+            idx = get(str(p))
+            self.g_slot_imps[s] += 1
+            if idx is not None:
+                self.fb_slot_imps[idx, s] += 1
+            if clicked and str(p) == clicked:
+                self.g_slot_clicks[s] += 1
+                if idx is not None:
+                    self.fb_clicks[idx] += 1
+            if purchased and str(p) == purchased:
+                self.g_slot_buys[s] += 1
+                if idx is not None:
+                    self.fb_buys[idx] += 1
+
+    def bootstrap_feedback(self) -> int:
+        """Al arrancar: las últimas 12 h de feedback, para no empezar de cero los contadores."""
+        rows = query(SQL_FEEDBACK_BOOT, timeout=120, name="feedback_boot")
+        for r in rows:
+            self.observe_feedback(as_list(r.get("shown")), as_pid(r.get("clicked")), as_pid(r.get("purchased")))
+        self.refresh_new_item_ctr()
+        return len(rows)
+
+    def refresh_new_item_ctr(self) -> int:
+        """CTR/CVR de los productos NUEVOS corregidos con el feedback real.
+        Se compara lo observado con lo esperado según el slot donde salió cada impresión (clics sobre clics
+        esperados), así que no importa si lo pusimos arriba o abajo. El resultado escala el valor heredado de
+        los vecinos de texto, con shrinkage: con pocas impresiones apenas cambia."""
+        if getattr(self, "fb_slot_imps", None) is None or self.g_slot_imps.sum() < 3000 or not self.new_items:
+            return 0
+        slot_ctr = (self.g_slot_clicks + 1.0) / (self.g_slot_imps + 50.0)
+        slot_cvr = (self.g_slot_buys + 0.5) / (self.g_slot_imps + 50.0)
+        idx = np.fromiter((i for i in self.new_items if i < self.n), np.int64)
+        idx = idx[np.isfinite(self.prior_ctr[idx])]
+        if not idx.size:
+            return 0
+        exp_c = self.fb_slot_imps[idx] @ slot_ctr
+        exp_b = self.fb_slot_imps[idx] @ slot_cvr
+        ratio_c = np.clip((self.fb_clicks[idx] + 5.0) / (exp_c + 5.0), 0.33, 3.0)
+        ratio_b = np.clip((self.fb_buys[idx] + 2.0) / (exp_b + 2.0), 0.33, 3.0)
+        self.item_feat[idx, F["car_ctr"]] = self.prior_ctr[idx] * ratio_c
+        self.item_feat[idx, F["car_cvr"]] = self.prior_cvr[idx] * ratio_b
+        return int(idx.size)
+
+    def add_own_purchases_ts(self) -> int:
+        """Entrenamiento: compras conseguidas con nuestras recomendaciones, CON su hora, como eventos de compra
+        del usuario. Así 'ya comprado' en las filas de feedback coincide con lo que se aplica en producción."""
+        rows = query(SQL_OWN_PURCHASES_TS, timeout=120, name="own_purchases_ts")
+        get = self.pid2idx.get
+        added = 0
+        for r in rows:
+            idx, ts, uid = get(str(r.get("product_id"))), parse_ts(r.get("ts")), str(r.get("user_id") or "")
+            if idx is None or ts is None or not uid:
+                continue
+            self.user_ev.setdefault(uid, []).append((ts, 1, idx))
+            added += 1
+        return added
 
     def add_purchase(self, user_id: str, pid: str) -> None:
         idx = self.pid2idx.get(pid)
@@ -1543,6 +1637,8 @@ def smoke_check() -> int:
         "live_coviews": SQL_LIVE_COVIEWS.replace("LIMIT 20 BY p", "LIMIT 1 BY p LIMIT 3"),
         "live_purchases": SQL_LIVE_PURCHASES_RECENT + " LIMIT 3",
         "own_purchases": SQL_OWN_PURCHASES + " LIMIT 3",
+        "own_purchases_ts": SQL_OWN_PURCHASES_TS + " LIMIT 3",
+        "feedback_boot": SQL_FEEDBACK_BOOT + " LIMIT 3",
         "user_sub_aff": SQL_USER_SUB_AFF.replace("{and_until_e}", "").replace(
             "{chunk}", "cityHash64(e.user_id::String) % 3000 = 0") + " LIMIT 3",
         "user_brand_aff": SQL_USER_BRAND_AFF.replace("{and_until_e}", "").replace(
